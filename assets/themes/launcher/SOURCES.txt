@@ -1,0 +1,17 @@
+themes/launcher icons
+The Home screen's shortcut row draws these at 28 px, tinted per shortcut
+(src/ui/gui_home_clock.c), and Settings uses stream_media.png for its
+Streaming row. 140x140 RGBA, transparent background.
+
+Icon Family: Phosphor Icons (Regular / Outline variant)
+License: MIT License
+https://github.com/phosphor-icons/core
+https://cdn.jsdelivr.net/npm/@phosphor-icons/core@2.1.1/assets/regular/<name>.svg
+
+Mapping:
+  music.png <- phosphor/music-notes-simple #FDBB63 (outline stems/beam, solid noteheads)
+  stream_media.png <- phosphor/cloud-arrow-down #55C2FE (outline cloud + download arrow)
+  sys_set.png <- phosphor/gear #C5CEDE (outline 8-tooth cog)
+
+radio.png is drawn by boards/r3pro/tools/gen_drawer_icons.py (white line art,
+original geometry: a table radio with dial, grille and antenna).

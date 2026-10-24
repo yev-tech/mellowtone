@@ -1,0 +1,89 @@
+#include "hiby_sys_server.h"
+#include "bluetooth_control.h"
+#include "debug_log.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#define SYS_SERVER_SOCKET_PATH "/var/run/sys_server"
+static const char * sys_server_path = SYS_SERVER_SOCKET_PATH;
+
+void hiby_sys_server_test_set_path(const char * path) { sys_server_path = path ? path : SYS_SERVER_SOCKET_PATH; }
+
+/* Timeout for sys_server Unix domain socket communication. */
+#define SYS_SERVER_TIMEOUT_MS 300
+
+static void send_command(const char * cmd) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+
+    struct timeval tv;
+    tv.tv_sec = SYS_SERVER_TIMEOUT_MS / 1000;
+    tv.tv_usec = (SYS_SERVER_TIMEOUT_MS % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sys_server_path);
+
+    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+        close(fd);
+        return;
+    }
+
+    if (send(fd, cmd, strlen(cmd), 0) < 0) {
+        close(fd);
+        return;
+    }
+
+    /* Drain reply so sys_server send does not block. */
+    char reply[64];
+    ssize_t got = recv(fd, reply, sizeof(reply) - 1, 0);
+    if (got > 0) {
+        reply[got] = '\0';
+        DBG_LOG("hiby_sys_server: \"%s\" -> \"%s\"\n", cmd, reply);
+    }
+
+    close(fd);
+}
+
+void hiby_sys_server_command(const char * cmd) {
+    if (cmd && cmd[0]) send_command(cmd);
+}
+
+void hiby_sys_server_report_playback_status(bool playing) {
+    send_command(playing ? "BT:PLAYER_STATUS:playing" : "BT:PLAYER_STATUS:paused");
+}
+
+void hiby_sys_server_report_metadata(const char * title, const char * artist,
+                                      const char * album, const char * genre, long length_ms) {
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "BT:METADATA:%s\t%s\t%s\t%s\t%ld",
+             title ? title : "", artist ? artist : "", album ? album : "", genre ? genre : "", length_ms);
+    send_command(cmd);
+}
+
+void hiby_sys_server_report_position(long position_ms) {
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "BT:POSITION:%ld", position_ms);
+    send_command(cmd);
+}
+
+void hiby_sys_server_report_volume(int percent) {
+    char mac[18];
+    if (!bt_control_get_connected_device_mac(mac, sizeof(mac))) return;
+
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    int raw = (percent * 127 + 50) / 100; /* Scale 0-100 to 0-127 AVRCP absolute volume */
+
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "BT:ABSVOL:%s %d", mac, raw);
+    send_command(cmd);
+}

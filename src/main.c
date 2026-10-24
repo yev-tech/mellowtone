@@ -1,0 +1,755 @@
+#include "lvgl/lvgl.h"
+#include "storage_paths.h"
+#include "audio.h"
+#include "backlight.h"
+#include "app_version.h"
+#include "branding.h"
+#include "mt_features.h"
+#include "metadata.h"
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <time.h>
+#ifdef HOST_BUILD
+#include <execinfo.h>
+#endif
+
+#include "gui.h"
+#include "loop_wake.h"
+#include "settings.h"
+#include "db_log.h"
+
+#ifdef HOST_BUILD
+  #include "src/drivers/sdl/lv_sdl_window.h"
+  #include "src/drivers/sdl/lv_sdl_mouse.h"
+  #include "src/drivers/sdl/lv_sdl_keyboard.h"
+#else
+  #include "src/drivers/display/fb/lv_linux_fbdev.h"
+  #include "src/drivers/evdev/lv_evdev.h"
+  #include "input_device_utils.h"
+  #include "hw_buttons.h"
+  #include "subprocess.h"
+  #include <fcntl.h>
+  #include <sys/ioctl.h>
+  #include <sys/stat.h>
+  #include <linux/fb.h>
+#endif
+
+#include "board.h"
+#include "board_config.h"
+#include "subprocess.h"
+#include "bluetooth_control.h"
+#include "power_events.h"
+#include "battery.h"
+#include "charger.h"
+#include "charge_control.h"
+#include "hiby_sys_client.h"
+#include "wifi_control.h"
+#include <linux/input.h>
+
+#define SCREEN_WIDTH BOARD_SCREEN_WIDTH
+#define SCREEN_HEIGHT BOARD_SCREEN_HEIGHT
+
+#ifdef HOST_BUILD
+static volatile sig_atomic_t running = 1;
+#endif
+
+/* Custom tick interface for LVGL timing (replaces older thread-based ticks) */
+static uint32_t custom_tick_get(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
+
+#ifdef UI_PERF_TRACE
+static uint64_t perf_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000ULL;
+}
+#endif
+
+#ifdef HOST_BUILD
+/* gui.h isn't included in the HOST_BUILD branch above (it pulls in
+ * target-only headers transitively), so this is the only declaration
+ * gui_init() gets there. */
+extern void gui_init(uint32_t screen_width, uint32_t screen_height);
+/* Host builds do not install the target crash handler. Shared workers still
+ * call this hook, so retain a no-op definition for the simulator. */
+void install_thread_crash_altstack(void) {}
+#endif
+
+#ifndef HOST_BUILD
+#include <ucontext.h>
+
+/* See scan_one_song_into_db()'s own comment (gui_library.c) -- breadcrumb
+ * for the metadata-parser crash handler below. Reading this global char
+ * array from a signal handler is safe (no allocation, no lock). */
+extern char g_scan_last_path[PATH_MAX];
+
+/* Signal handler that logs register state and a stack word scan to the
+ * opt-in .logs/reload_diag.log, then re-raises the signal with the default
+ * handler. */
+static void crash_diag_handler(int sig, siginfo_t * info, void * ucontext_v) {
+    if (!db_log_enabled()) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+    /* Plain open(): signal-safe. logs/ exists only on a mounted card. */
+    int fd = open(MT_LOGS_DIR "/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        ucontext_t * uc = (ucontext_t *) ucontext_v;
+        unsigned long pc = (unsigned long) uc->uc_mcontext.pc;
+        unsigned long ra = (unsigned long) uc->uc_mcontext.gregs[31];
+        unsigned long sp = (unsigned long) uc->uc_mcontext.gregs[29];
+        unsigned long a0 = (unsigned long) uc->uc_mcontext.gregs[4];
+        unsigned long a1 = (unsigned long) uc->uc_mcontext.gregs[5];
+        char buf[256];
+        int len = snprintf(buf, sizeof(buf),
+            "[pid=%ld] *** CRASH sig=%d fault_addr=%p pc=%08lx ra=%08lx sp=%08lx a0=%08lx a1=%08lx ***\n",
+            (long) getpid(), sig, info ? info->si_addr : NULL, pc, ra, sp, a0, a1);
+        if (len > 0) { ssize_t r = write(fd, buf, (size_t) len); (void) r; }
+        if (g_scan_last_path[0]) {
+            len = snprintf(buf, sizeof(buf), "[pid=%ld]   scan_last_path = %s\n",
+                            (long) getpid(), g_scan_last_path);
+            if (len > 0) {
+                /* snprintf returns the required length even when truncated. */
+                size_t written = (size_t) len < sizeof(buf) ? (size_t) len : sizeof(buf) - 1;
+                ssize_t r = write(fd, buf, written); (void) r;
+            }
+        }
+        for (unsigned long addr = sp; addr < sp + 2048 && addr >= sp; addr += 4) {
+            unsigned long word = *(unsigned long *) addr;
+            if (word >= 0x400000UL && word < 0x9d0000UL) {
+                len = snprintf(buf, sizeof(buf), "[pid=%ld]   stack[+%04lx] = %08lx\n",
+                                (long) getpid(), addr - sp, word);
+                if (len > 0) { ssize_t r = write(fd, buf, (size_t) len); (void) r; }
+            }
+        }
+        fsync(fd);
+        close(fd);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Installs a per-thread signal alternate stack so crash_diag_handler() can
+ * run even when the thread's own stack is exhausted. Must be called at
+ * thread start for each worker thread that uses a custom stack size. */
+void install_thread_crash_altstack(void) {
+    static _Thread_local uint8_t altstack_buf[32768];
+    stack_t ss;
+    ss.ss_sp = altstack_buf;
+    ss.ss_size = sizeof(altstack_buf);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+}
+
+/* Polls /dev/fb0 with a real open()+ioctl() check rather than trusting the
+ * device node's mere existence -- the node can appear before the underlying
+ * driver has finished settling, and using it too early crashes on the first
+ * render flush. */
+static bool wait_for_fbdev_ready(const char * path, int max_attempts, int delay_ms) {
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        int fd = open(path, O_RDWR);
+        if (fd >= 0) {
+            struct fb_var_screeninfo vinfo;
+            bool ok = (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0);
+            close(fd);
+            if (ok) return true;
+        }
+        usleep(delay_ms * 1000);
+    }
+    return false;
+}
+
+/* True if a real filesystem is mounted at BOARD_SD_ROOT (its st_dev differs
+ * from its parent's), as opposed to just an empty directory sitting there. */
+static bool sd_mount_point_mounted(void) {
+    struct stat parent_st, mnt_st;
+    if (stat(BOARD_SD_PARENT, &parent_st) != 0) return false;
+    if (stat(BOARD_SD_ROOT "", &mnt_st) != 0) return false;
+    return parent_st.st_dev != mnt_st.st_dev;
+}
+
+/* mdev normally creates these nodes when hardware appears.  If mdev died or
+ * missed the hotplug event, an old node can remain in /dev with the previous
+ * major/minor pair.  Read the kernel's current pair from sysfs and repair
+ * only nodes explicitly requested by the callers below.  Never replace a
+ * non-device entry: an unexpected file or symlink must remain untouched. */
+static void sync_device_node_from_sysfs(const char * sysfs_class,
+                                        const char * device_name,
+                                        const char * device_path,
+                                        mode_t device_type) {
+    char sysfs_path[PATH_MAX];
+    unsigned int major_num, minor_num;
+    struct stat node_st;
+    FILE * sysfs;
+
+    if (snprintf(sysfs_path, sizeof(sysfs_path),
+                 "/sys/class/%s/%s/dev", sysfs_class, device_name) >= (int) sizeof(sysfs_path)) {
+        return;
+    }
+    sysfs = fopen(sysfs_path, "r");
+    if (!sysfs) return;
+    if (fscanf(sysfs, "%u:%u", &major_num, &minor_num) != 2) {
+        fclose(sysfs);
+        return;
+    }
+    fclose(sysfs);
+
+    dev_t expected = makedev(major_num, minor_num);
+    if (lstat(device_path, &node_st) == 0) {
+        if ((node_st.st_mode & S_IFMT) != device_type) return;
+        if (node_st.st_rdev == expected) return;
+        if (unlink(device_path) != 0) return;
+    } else if (errno != ENOENT) {
+        return;
+    }
+
+    (void) mknod(device_path, device_type | 0660, expected);
+}
+
+static void sync_sd_device_nodes(void) {
+    sync_device_node_from_sysfs("block", "mmcblk0", "/dev/mmcblk0", S_IFBLK);
+    sync_device_node_from_sysfs("block", "mmcblk0p1", "/dev/mmcblk0p1", S_IFBLK);
+}
+
+/* Recover the two internal ALSA nodes needed by audio_init() when mdev has
+ * missed the sound-card event.  mkdir() is intentionally non-destructive:
+ * an existing unexpected /dev/snd entry is left alone. */
+static void sync_sound_device_nodes(void) {
+    struct stat snd_dir_st;
+
+    if (lstat("/dev/snd", &snd_dir_st) != 0) {
+        if (errno != ENOENT || mkdir("/dev/snd", 0755) != 0) return;
+    }
+    if (lstat("/dev/snd", &snd_dir_st) != 0 || !S_ISDIR(snd_dir_st.st_mode)) return;
+
+    sync_device_node_from_sysfs("sound", "controlC0", "/dev/snd/controlC0", S_IFCHR);
+    sync_device_node_from_sysfs("sound", "pcmC0D0p", "/dev/snd/pcmC0D0p", S_IFCHR);
+}
+
+/* Tries each supported filesystem type (vfat, exfat, NTFS) against one
+ * device node in turn, stopping at the first that actually mounts.
+ *
+ * NTFS is intentionally mounted through the ntfs-3g binary included in the
+ * firmware image.  This kernel/BusyBox combination has no usable in-kernel
+ * `ntfs` mount path (and no mount.ntfs helper), so `mount -t ntfs` never
+ * reached the driver that is actually shipped on the device. */
+static void try_mount_sd_device_node(const char * device_node) {
+    char * vfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "vfat", (char *) "-o",
+                            (char *) "rw,relatime,fmask=0022,dmask=0022,codepage=936,iocharset=utf8,shortname=mixed",
+                            (char *) device_node, (char *) BOARD_SD_ROOT "", NULL };
+    subprocess_run(vfat_argv, NULL, 0);
+    if (sd_mount_point_mounted()) return;
+
+    char * exfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "exfat", (char *) "-o",
+                             (char *) "rw,relatime", (char *) device_node, (char *) BOARD_SD_ROOT "", NULL };
+    subprocess_run(exfat_argv, NULL, 0);
+    if (sd_mount_point_mounted()) return;
+
+    char * ntfs_argv[] = { (char *) "/usr/bin/ntfs-3g", (char *) "-o",
+                            (char *) "rw,relatime,big_writes,umask=0022",
+                            (char *) device_node, (char *) BOARD_SD_ROOT "", NULL };
+    subprocess_run(ntfs_argv, NULL, 0);
+}
+
+/* Ensures the SD card is mounted at BOARD_SD_ROOT. Creates the mount point
+ * first (best-effort -- /data/mnt may not exist yet on a fresh boot), then
+ * tries the card's partition node, falling back to the whole-disk node for
+ * a partition-less ("superfloppy") card. */
+void mount_sd_card_if_needed(void) {
+    /* The system mounts the card (R3 Pro: S91_early_mount.sh). Never mount,
+     * check or repair it from here: a second mount of the same exFAT volume
+     * would corrupt it. */
+    if (BOARD.system.mounts_sd) return;
+    mkdir(BOARD_SD_PARENT, 0755);
+    mkdir(BOARD_SD_ROOT "", 0755);
+    if (!sd_mount_point_mounted()) {
+        sync_sd_device_nodes();
+        try_mount_sd_device_node("/dev/mmcblk0p1");
+        if (!sd_mount_point_mounted()) try_mount_sd_device_node("/dev/mmcblk0");
+    }
+}
+
+/* A software-triggered reboot can start this S92 process before the SD
+ * block node has reappeared. The one early mount attempt above then misses
+ * it, and plugin_manager_init() later sees no plugins directory; unlike the
+ * library, plugin-backed screens are built only once and cannot recover on
+ * the later hotplug poll. Called immediately after painting the splash, so
+ * this bounded wait overlaps the player's own splash and remains useful for
+ * standalone test launches that bypass the launcher.
+ * Avoid running mount helpers until a real node exists. */
+static void settle_sd_mount_during_splash(void) {
+    const int attempts = 25;
+    for (int i = 0; i < attempts; i++) {
+        if (sd_mount_point_mounted()) return;
+        if (access("/dev/mmcblk0p1", F_OK) == 0 || access("/dev/mmcblk0", F_OK) == 0) {
+            mount_sd_card_if_needed();
+            if (sd_mount_point_mounted()) return;
+        }
+        usleep(100000);
+    }
+}
+
+/* Lightweight boot-time diagnostic log at /usr/data/boot_debug.log, readable
+ * via adb even after a crash/reboot loop (hiby_player.sh reboots
+ * unconditionally on any exit). Not static: gui_init() (gui.c) also calls
+ * this directly via its own extern declaration. */
+static int boot_debug_fd = -1;
+
+/* Closes the boot log for good (USB storage lends the card: no file may
+ * stay open on it). Later checkpoints are dropped rather than reopening it
+ * with O_TRUNC. Not static, like boot_checkpoint(). */
+void boot_checkpoint_release(void) {
+    if (boot_debug_fd >= 0) close(boot_debug_fd);
+    boot_debug_fd = -2;
+}
+
+void boot_checkpoint(const char * step) {
+    if (boot_debug_fd == -2) return;
+    if (boot_debug_fd < 0) {
+        /* O_TRUNC, not O_APPEND -- only this boot's sequence matters, and
+         * opened once per process lifetime so this naturally resets fresh
+         * on every boot. */
+        /* On the SD card, like every log: no churn on internal flash. Before
+         * the card is mounted this returns -1 and the next checkpoint tries
+         * again. */
+        boot_debug_fd = mt_log_open("boot_debug.log", O_WRONLY | O_CREAT | O_TRUNC);
+        if (boot_debug_fd < 0) return;
+    }
+    char buf[160];
+    int len = snprintf(buf, sizeof(buf), "[%u ms] %s\n", (unsigned) custom_tick_get(), step);
+    if (len <= 0) return;
+    ssize_t unused_result = write(boot_debug_fd, buf, (size_t) len);
+    (void) unused_result;
+    fdatasync(boot_debug_fd);
+}
+#endif
+
+#ifdef HOST_BUILD
+/* Host-only dev convenience: provides backtraces on crashes during host simulation.
+ * Device builds use the async-signal-safe crash_diag_handler below. */
+// handler for signals that indicate crashes like SIGSEGV or SIGABRT
+void crash_handler(int sig) {
+    void *buffer[128];
+    int size;
+
+    size = backtrace(buffer, 128);
+
+    // Write directly to stderr (safe in signal handlers)
+    write(STDERR_FILENO, "Crashed! Backtrace:\n", 20);
+    backtrace_symbols_fd(buffer, size, STDERR_FILENO);
+    exit(1);
+}
+
+/* Host-only: clean shutdown on SIGINT (Ctrl-C) in terminal for SDL simulator.
+ * On device builds, the main loop runs continuously and shutdown is supervised. */
+// handler for SIGINT
+static void sigint_handler(int sig) {
+	(void)sig;
+	running = 0;
+
+	// TODO: add more cleanup (like turning off the screen)
+}
+#endif
+
+int main(int argc, char ** argv) {
+    /* Identity only, before anything touches the hardware (the image
+     * recipe's check B5 runs it under qemu). */
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("%s %s (%s, %s)\n", MT_PRODUCT_NAME, app_version_label(), app_build_identifier(), BOARD.name);
+        return 0;
+    }
+    /* The optional features built in, as plugins see them (tests/features). */
+    if (argc == 2 && strcmp(argv[1], "--features") == 0) {
+        for (size_t i = 0; i < MT_FEATURE_COUNT; i++)
+            printf("%s=%d\n", MT_FEATURES[i].name, MT_FEATURES[i].enabled ? 1 : 0);
+        return 0;
+    }
+    /* Ignore SIGPIPE process-wide: a Bluetooth disconnect during playback
+     * kills the `aplay -D bluealsa` child audio_output.c writes into, and
+     * without this the next write() would kill the whole process instead of
+     * just returning EPIPE (which audio_output_write() already handles
+     * correctly). Must run before anything else opens a subprocess pipe. */
+    signal(SIGPIPE, SIG_IGN);
+    /* Before anything runs a command (BOARD.system.exec_allow, R3 Pro). */
+    subprocess_set_exec_allow(BOARD.system.exec_allow);
+#ifdef HOST_BUILD
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+    signal(SIGINT, sigint_handler);  // interrupt handling (ctrl-c in terminal)
+#endif
+
+#ifndef HOST_BUILD
+    struct sigaction crash_sa;
+    memset(&crash_sa, 0, sizeof(crash_sa));
+    crash_sa.sa_sigaction = crash_diag_handler;
+    /* SA_ONSTACK: required so crash_diag_handler() can run on a thread whose
+     * own stack is exhausted. Only takes effect for threads that have called
+     * sigaltstack() (install_thread_crash_altstack()). */
+    crash_sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &crash_sa, NULL);
+    sigaction(SIGBUS, &crash_sa, NULL);
+#endif
+
+    /* Recognized before validating the full argument count, so a malformed
+     * helper invocation (wrong arg count, unparsable fd/priority) fails
+     * fast here rather than falling through into normal application
+     * startup with a leftover "--metadata-artwork-helper" argv entry. */
+    if (argc >= 2 && strcmp(argv[1], "--metadata-artwork-helper") == 0) {
+        if (argc != 5) return 1;
+        char * end = NULL;
+        errno = 0;
+        long fd = strtol(argv[2], &end, 10);
+        if (errno != 0 || !end || end == argv[2] || *end != '\0' || fd < 0 || fd > INT_MAX) return 1;
+        /* argv[4]: the parent's real artwork_priority_t (see
+         * metadata_read_artwork_isolated_impl()'s own comment on why this
+         * crosses the fork/exec boundary as a decimal string) -- any
+         * unparsable or out-of-range value defaults to the most
+         * conservative ARTWORK_PRIO_WARMER rather than being trusted, since
+         * a malformed value here must never grant a LARGER memory ceiling
+         * than intended. */
+        end = NULL;
+        errno = 0;
+        long prio_val = strtol(argv[4], &end, 10);
+        artwork_priority_t prio = ARTWORK_PRIO_WARMER;
+        if (errno == 0 && end && end != argv[4] && *end == '\0' &&
+            (prio_val == ARTWORK_PRIO_WARMER || prio_val == ARTWORK_PRIO_THUMBNAIL ||
+             prio_val == ARTWORK_PRIO_PLAYER)) {
+            prio = (artwork_priority_t) prio_val;
+        }
+        return metadata_artwork_helper_run(argv[3], (int) fd, prio);
+    }
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("Starting " MT_PRODUCT_NAME "...\n");
+
+#ifndef HOST_BUILD
+    boot_checkpoint("main entered");
+
+    /* Fallback library search path on the writable partition, for restoring
+     * a shared library the read-only squashfs rootfs is missing without
+     * needing a reflash (e.g. libldacdec.so, required by bluealsa). */
+    setenv("LD_LIBRARY_PATH", BOARD_DATA_ROOT "/lib", 1);
+
+    /* ALSA looks for $HOME/.asoundrc, and the rootfs is a read-only
+     * squashfs, so point HOME at the writable partition. Bluetooth playback
+     * writes a rate-pinned PCM definition there; the file only adds a PCM
+     * name, leaving local and USB output untouched. */
+    setenv("HOME", BOARD_DATA_ROOT "/alsa", 1);
+    /* An image install starts with no BOARD_DATA_ROOT (its install root is in
+     * the rootfs); the flash files that stay there (ALSA config, flags) need it. */
+    if (mkdir(BOARD_DATA_ROOT, 0755) != 0 && errno != EEXIST)
+        fprintf(stderr, "mkdir %s: %s\n", BOARD_DATA_ROOT, strerror(errno));
+
+    /* Must run before gui_init(), which reads from the SD card. */
+    mount_sd_card_if_needed();
+    boot_checkpoint("mount_sd_card_if_needed done");
+    /* State lives on the card: create its directories (nothing
+     * without a writable card), then note the card state before anything
+     * reads settings. */
+    (void) mt_state_create_layout();
+    mt_state_init();
+    boot_checkpoint("state root ready");
+    if (BOARD.system.hiby_sys_server) {
+        /* Serve /var/run/sys_client as the stock player does: sys_server
+         * reports Wi-Fi/BT command results there and HiBy's Bluetooth ALSA
+         * plugin ends every open with a "BT:CODEC ..." message, each blocking
+         * until answered. A socket left bound by the stock player with nobody
+         * reading it would hang Bluetooth playback, so it is always re-bound. */
+        if (!hiby_sys_client_start()) unlink("/var/run/sys_client");
+    }
+    /* BlueZ 4 back end: a detached thread that waits for the stock bt_init
+     * before any D-Bus call (no-op on BlueZ 5). */
+    bt_control_restore_boot_power();
+    /* Battery and charger: one power-event thread (uevents,
+     * CHARGE:* from sys_client, 60 s fallback poll) feeding the battery
+     * cache, the stock USB input-current policy (CAP_INPUT_CURRENT; the stock
+     * player used to apply it) and stop/resume charge control. */
+    power_events_start(NULL);
+    battery_init();
+    charge_control_init();
+    charger_input_current_start();
+    /* Wi-Fi: the control-socket worker, then the saved power choice. */
+    if (board_has(CAP_WIFI)) {
+        wifi_control_init();
+        wifi_control_restore_boot_power();
+    }
+
+    /* Deliberately no startup-time Bluetooth/D-Bus cleanup call here -- see
+     * bluetooth_control.h's comment above bt_control_is_powered(): doing
+     * that work at this point in boot reliably hangs the app before it
+     * reaches the main loop. */
+#endif
+
+    /* 1. Initialize LVGL core */
+    lv_init();
+
+    /* Register the custom tick source */
+    lv_tick_set_cb(custom_tick_get);
+#ifndef HOST_BUILD
+    boot_checkpoint("lv_init done");
+#endif
+
+#ifdef HOST_BUILD
+    printf("Initializing Host Build (SDL2 Simulation at %dx%d)...\n", SCREEN_WIDTH, SCREEN_HEIGHT);
+
+    /* Create SDL2 window and display */
+    lv_display_t * disp = lv_sdl_window_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+    if (!disp) {
+        fprintf(stderr, "Error: Failed to create SDL2 window\n");
+        return 1;
+    }
+    (void) mt_state_create_layout();
+    mt_state_init();
+    settings_load(&current_settings);
+    if (current_settings.screen_upside_down) {
+        lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_180);
+    }
+
+    /* Register Mouse as Pointer device (maps mouse click -> touch) */
+    lv_indev_t * mouse = lv_sdl_mouse_create();
+    if (mouse) {
+        lv_indev_set_display(mouse, disp);
+    }
+
+    /* Register Keyboard as Keypad device */
+    lv_indev_t * kbd = lv_sdl_keyboard_create();
+    if (kbd) {
+        lv_indev_set_display(kbd, disp);
+    }
+#else
+    printf("Initializing Target Build (Linux Framebuffer and EVDEV touch)...\n");
+
+    /* Create Framebuffer display */
+    lv_display_t * disp = lv_linux_fbdev_create();
+    if (!disp) {
+        fprintf(stderr, "Error: Failed to create Linux framebuffer display\n");
+        boot_checkpoint("lv_linux_fbdev_create FAILED, returning 1");
+        return 1;
+    }
+    boot_checkpoint("lv_linux_fbdev_create done");
+    if (!wait_for_fbdev_ready("/dev/fb0", 50, 100)) {
+        fprintf(stderr, "Warning: /dev/fb0 not ready after 5s of retries, proceeding anyway...\n");
+    }
+    boot_checkpoint("wait_for_fbdev_ready done");
+    if (lv_linux_fbdev_set_file(disp, "/dev/fb0") != LV_RESULT_OK) {
+        fprintf(stderr, "Error: Failed to open framebuffer device /dev/fb0\n");
+        boot_checkpoint("lv_linux_fbdev_set_file FAILED, returning 1");
+        return 1;
+    }
+    boot_checkpoint("lv_linux_fbdev_set_file done");
+
+    settings_load(&current_settings);
+    if (current_settings.screen_upside_down != (BOARD.screen.rotation == 180)) {
+        lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_180);
+    }
+
+    /* As early as this process can paint anything -- see gui_show_boot_
+     * splash()'s own comment (gui.c) for why this exists and how gui_init()
+     * further down uses the tick recorded here. */
+    gui_show_boot_splash();
+    boot_checkpoint("gui_show_boot_splash done");
+
+    settle_sd_mount_during_splash();
+    boot_checkpoint("settle_sd_mount_during_splash done");
+
+    /* Create Touch Input device via evdev. Auto-detect the touch controller
+     * by the board's names (BOARD.input.touch, first found wins); fall back
+     * to guessing event0/event1 for variants where that lookup doesn't match. */
+    lv_indev_t * touch = NULL;
+    char touch_path[64];
+    for (const char * const * name = BOARD.input.touch; name && *name; name++) {
+        if (!find_input_device_by_name(*name, touch_path, sizeof(touch_path))) continue;
+        printf("Detected touch controller at %s\n", touch_path);
+        touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_path);
+        break;
+    }
+    boot_checkpoint("touch auto-detect attempt done");
+    if (!touch) {
+        fprintf(stderr, "Warning: Touch controller not auto-detected. Guessing /dev/input/event0...\n");
+        snprintf(touch_path, sizeof(touch_path), "/dev/input/event0");
+        touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_path);
+    }
+    if (!touch) {
+        fprintf(stderr, "Warning: Failed to open /dev/input/event0. Trying event1...\n");
+        snprintf(touch_path, sizeof(touch_path), "/dev/input/event1");
+        touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_path);
+    }
+    boot_checkpoint("touch setup done");
+
+    if (touch) {
+        lv_indev_set_display(touch, disp);
+        /* The touch controller reports in the viewer's orientation while the
+         * panel is mounted 180 degrees from it, and LVGL rotates pointer
+         * input together with the display. Invert the calibration so the two
+         * flips cancel, whichever way "screen upside down" is set. */
+        if (BOARD.screen.rotation == 180) {
+            int min_x = 0, max_x = BOARD_SCREEN_WIDTH - 1, min_y = 0, max_y = BOARD_SCREEN_HEIGHT - 1;
+            struct input_absinfo ai;
+            int tfd = open(touch_path, O_RDONLY | O_CLOEXEC);
+            if (tfd >= 0) {
+                if (ioctl(tfd, EVIOCGABS(ABS_X), &ai) == 0 && ai.maximum > ai.minimum) {
+                    min_x = ai.minimum;
+                    max_x = ai.maximum;
+                }
+                if (ioctl(tfd, EVIOCGABS(ABS_Y), &ai) == 0 && ai.maximum > ai.minimum) {
+                    min_y = ai.minimum;
+                    max_y = ai.maximum;
+                }
+                close(tfd);
+            }
+            lv_evdev_set_calibration(touch, max_x, max_y, min_x, min_y);
+            printf("Touch calibration inverted: x %d..%d, y %d..%d\n", min_x, max_x, min_y, max_y);
+        }
+        printf("Touch screen input driver successfully registered.\n");
+    } else {
+        fprintf(stderr, "Warning: No touch input device found.\n");
+    }
+
+    /* Physical volume/skip/play-pause buttons: a separate poller thread,
+     * since they're media-key shortcuts (act regardless of what's focused),
+     * not keypad navigation for the UI. */
+    hw_buttons_init();
+    boot_checkpoint("hw_buttons_init done");
+#endif
+
+    /* 2. Initialize audio playback and the application GUI */
+#ifndef HOST_BUILD
+    sync_sound_device_nodes();
+#endif
+    audio_init();
+#ifndef HOST_BUILD
+    boot_checkpoint("audio_init done");
+#endif
+    gui_init(SCREEN_WIDTH, SCREEN_HEIGHT);
+#ifndef HOST_BUILD
+    boot_checkpoint("gui_init done");
+#endif
+    /* mellowtone-launcher started an older or the factory version after
+     * crashes: say so once. */
+    gui_settings_show_launcher_notice();
+
+    /* 3. Main event loop */
+    printf("Entering main event loop...\n");
+#ifndef HOST_BUILD
+    boot_checkpoint("entering main loop");
+#endif
+    /* LVGL normally calls its registered tick callback thousands of times
+     * per second. On this old 32-bit kernel, musl implements each call as a
+     * failing clock_gettime64 syscall followed by a legacy clock_gettime
+     * fallback. Switch LVGL to its in-memory tick counter after setup and
+     * advance it once per handler iteration from one real clock read. Timer
+     * semantics remain identical: the tick is stable while one handler pass
+     * runs, just like the conventional interrupt-driven lv_tick_inc model. */
+    /* Preserve LVGL's exact clock domain across the handoff to prevent
+     * wraparound differences with interactive timeout baselines. */
+    uint32_t lvgl_handoff_tick = lv_tick_get();
+    uint32_t last_real_tick = custom_tick_get();
+    lv_tick_inc(lvgl_handoff_tick);
+    lv_tick_set_cb(NULL);
+#ifndef HOST_BUILD
+    /* Must be after lv_tick_set_cb(NULL): this baseline must belong to the
+     * runtime clock that update_timer_cb will read, not the boot clock. */
+    gui_reset_interactive_timeout_baseline();
+#endif
+#ifdef UI_PERF_TRACE
+    uint32_t perf_report_tick = last_real_tick;
+    uint64_t perf_handler_total_us = 0;
+    uint64_t perf_handler_max_us = 0;
+    unsigned perf_handler_calls = 0;
+    unsigned perf_handler_over_16ms = 0;
+#endif
+    /* HOST_BUILD only: a stray SIGINT on the real device must NOT reach this
+     * loop's exit path -- falling through to gui_deinit(); return 0; makes
+     * mellowtone-launcher treat it as a clean, intentional shutdown
+     * request (on X1600 it powers the device off). sigint_handler
+     * is only ever wired up under HOST_BUILD (see main()'s own signal()
+     * call above), so `running` never leaves 1 on-device either way, but
+     * looping on the literal constant here keeps that guarantee visible at
+     * the one place it actually matters instead of relying on a variable
+     * defined and set far away. */
+#ifdef HOST_BUILD
+    while (running) {
+#else
+    while (1) {
+#endif
+        uint32_t real_tick = custom_tick_get();
+        lv_tick_inc(real_tick - last_real_tick);
+        last_real_tick = real_tick;
+#ifdef UI_PERF_TRACE
+        uint64_t perf_handler_start_us = perf_now_us();
+#endif
+        uint32_t time_till_next = lv_timer_handler();
+        /* After lv_tick_set_cb(NULL), LVGL's tick stays frozen at the loop-top
+         * lv_tick_inc() value for this entire handler pass. lv_timer_exec()
+         * stamps timer->last_run = lv_tick_get() (that frozen value)
+         * immediately before invoking the callback, so a blocking callback --
+         * the transition compositor waiting on FBIOPAN_DISPLAY vsync,
+         * commonly ~16ms -- is invisible to LVGL's time_till_next math, which
+         * then returns the timer's full period again. Sleeping that full
+         * amount on top of time already spent doubles the cycle. One extra
+         * custom_tick_get() here is cheap next to the thousands of
+         * clock_gettime() calls the NULL-cb handoff was designed to avoid.
+         * last_real_tick is left at the loop-top read: the next lv_tick_inc()
+         * must still measure loop-top-to-loop-top, independent of this
+         * sleep-only correction. */
+        uint32_t handler_elapsed_ms = custom_tick_get() - real_tick;
+        if (time_till_next > handler_elapsed_ms) time_till_next -= handler_elapsed_ms;
+        else time_till_next = 0;
+#ifdef UI_PERF_TRACE
+        uint64_t perf_handler_us = perf_now_us() - perf_handler_start_us;
+        perf_handler_total_us += perf_handler_us;
+        if (perf_handler_us > perf_handler_max_us) perf_handler_max_us = perf_handler_us;
+        perf_handler_calls++;
+        if (perf_handler_us >= 16000) perf_handler_over_16ms++;
+        if ((uint32_t) (real_tick - perf_report_tick) >= 1000) {
+            printf("PERF main handler calls=%u avg_us=%llu max_us=%llu over16=%u next_ms=%u screen_on=%d\n",
+                   perf_handler_calls,
+                   (unsigned long long) (perf_handler_calls ? perf_handler_total_us / perf_handler_calls : 0),
+                   (unsigned long long) perf_handler_max_us, perf_handler_over_16ms, time_till_next,
+                   backlight_screen_is_on());
+            perf_report_tick = real_tick;
+            perf_handler_total_us = 0;
+            perf_handler_max_us = 0;
+            perf_handler_calls = 0;
+            perf_handler_over_16ms = 0;
+        }
+#endif
+        /* Cap idle sleep duration: lv_timer_handler() returns LV_NO_TIMER_READY
+         * (0xFFFFFFFF) when no unpaused timers are ready, which would overflow
+         * microsecond conversion. */
+        /* Screen-off CPU/battery optimization: while the backlight is off,
+         * gui.c's own update_timer_cb() (still running every 500ms -- see
+         * its own comment on why that keeps going regardless) is the only
+         * timer that still needs prompt service; LVGL's display-refresh
+         * timer is paused for the same duration (see gui.c's screen_just_
+         * woke/screen_on_now handling), so there's nothing display-related
+         * this loop needs to wake up quickly for. Raising the idle cap to
+         * match that 500ms cadence while off (kept at 100ms while on, for
+         * touch/animation responsiveness) is what actually cuts main-loop
+         * wakeups -- backlight_screen_is_on() is the same shared source of
+         * truth gui.c itself uses, so this can never disagree with the
+         * paused/resumed state of the refresh timer. */
+        /* Quiet idle (screen off, nothing playing, see gui.c): the timers
+         * themselves run every few seconds, and loop_wake_signal() from a
+         * background thread (keys, AVRCP, power events) ends the sleep early;
+         * gui_loop_woken() then runs the control timers at once. */
+        uint32_t idle_cap_ms = backlight_screen_is_on() ? 100 : gui_quiet_idle_active() ? 10000 : 500;
+        if (time_till_next > idle_cap_ms) time_till_next = idle_cap_ms;
+        if (loop_wake_wait(time_till_next)) gui_loop_woken();
+    }
+
+    gui_deinit();
+    return 0;
+}

@@ -1,0 +1,15 @@
+# mt-bluez: builds the R3 Pro bluetoothd from the official BlueZ 4.101 tarball plus
+# patches/bluez-4.101/series. The Ingenic toolchain and the device sysroot are not in
+# the image; ./mt mounts them read-only from the paths you give (see docs/BUILDING.md):
+#   /opt/ingenic  <- MT_INGENIC_TC  (release_halley2_v1.0-20151221/toolchains/mips-gcc472-glibc216)
+#   /opt/sysroot  <- MT_BT_SYSROOT  (device glib/dbus/ffi/zlib libraries + headers)
+FROM docker.io/library/debian:trixie-slim@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl file git make patch pkg-config python3 xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY build.sh /usr/local/bin/mt-bluez-build
+RUN chmod 755 /usr/local/bin/mt-bluez-build
+WORKDIR /src

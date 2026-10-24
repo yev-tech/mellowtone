@@ -1,0 +1,70 @@
+#ifndef HW_BUTTONS_H
+#define HW_BUTTONS_H
+
+#include <stdbool.h>
+
+/* Starts a background thread reading the R1's physical volume/skip/play-pause
+ * buttons. They're exposed as two separate evdev nodes (md-gpio-keys and
+ * "jz adc keyboard"), already decoded by the kernel driver into standard key
+ * codes (KEY_VOLUMEUP/DOWN, KEY_PLAYPAUSE, KEY_NEXTSONG/PREVIOUSSONG).
+ *
+ * These act as direct hardware shortcuts, not keypad navigation for the UI,
+ * so this bypasses LVGL's indev/keypad abstraction entirely: the reader
+ * thread only sets flags/counters here, and the GUI's own periodic timer
+ * (already running on the one thread allowed to touch LVGL widgets) polls
+ * and applies them via the consume_* functions below. */
+void hw_buttons_init(void);
+
+/* Returns the number of physical play/pause presses since the last consume
+ * (usually 0 or 1, but can be 2+ if two presses land inside one 500ms poll
+ * window -- see hw_buttons.c's play_pause_press_count for why this is a
+ * count rather than a bool), and resets it to 0. */
+int hw_buttons_consume_play_pause(void);
+
+/* True once a press-and-release completes WITHOUT having crossed the
+ * hold-to-seek threshold (see hw_buttons_consume_next_seek_steps() below) --
+ * same "fires on release, suppressed once the hold takes over" convention as
+ * hw_buttons_consume_power()/_power_long_press() above. */
+bool hw_buttons_consume_next(void);
+bool hw_buttons_consume_prev(void);
+
+/* Next button, held: number of forward-seek steps (each worth
+ * TRANSPORT_SEEK_STEP_SECONDS, gui_player.c) accumulated since the last
+ * call, then reset to 0 -- same accumulate-on-the-reader-thread,
+ * apply-on-the-GUI-thread split as hw_buttons_consume_volume_delta(), so the
+ * repeat rate isn't limited by the GUI's own 500ms poll interval.
+ * *out_is_first is set true if this batch includes the very first step of a
+ * new hold (the caller should reset its seek-target accumulator from the
+ * live playback position for that step, same as a touch long-press's first
+ * LV_EVENT_LONG_PRESSED vs its later LV_EVENT_LONG_PRESSED_REPEAT ticks).
+ * Mutually exclusive with hw_buttons_consume_next() for the same physical
+ * press, same as the power button's short-tap/long-press pair. */
+int hw_buttons_consume_next_seek_steps(bool * out_is_first);
+
+/* Power button, short tap: true once a press-and-release completes without
+ * having crossed the long-press threshold (see hw_buttons_consume_power_
+ * long_press() below) -- the existing "toggle the screen on/off" gesture.
+ * Fires on release, not on press-down, specifically so it can be suppressed
+ * when the same press turns into a long-press instead (see
+ * handle_key_event()'s own comment in the .c file). Must be applied on the
+ * GUI thread (not the reader thread that detects it) so the backlight
+ * toggle and the LVGL inactivity clock it shares with auto screen-timeout
+ * stay in sync -- see gui.c's update_timer_cb. */
+bool hw_buttons_consume_power(void);
+/* Double-tap to wake: armed by gui.c while the screen is off. */
+void hw_buttons_set_tap_wake_armed(bool armed);
+bool hw_buttons_consume_tap_wake(void);
+
+/* Power button, long press: true once, edge-triggered, the moment a hold
+ * crosses the long-press threshold -- while still held, not on release --
+ * so the consumer (gui.c) can bring up a power-off countdown immediately
+ * rather than waiting for the finger to lift. Mutually exclusive with
+ * hw_buttons_consume_power() for the same physical press: once this fires,
+ * that press's eventual release does not also set the short-tap flag. */
+bool hw_buttons_consume_power_long_press(void);
+
+/* Net accumulated volume step (in percent) since the last call, then reset
+ * to 0. Positive for volume up, negative for volume down. */
+int hw_buttons_consume_volume_delta(void);
+
+#endif /* HW_BUTTONS_H */

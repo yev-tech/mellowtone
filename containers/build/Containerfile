@@ -1,0 +1,19 @@
+# mt-build: builds the player (every board), the host simulator, tests and translations.
+# Build context: the repository's tools/release/ directory (see ./mt setup).
+# libdbus-1-dev: the host simulator's Bluetooth back ends; dbus-daemon and
+# python3-dbusmock: the Bluetooth tests' private bus and fake BlueZ.
+FROM docker.io/library/debian:trixie-slim@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential ca-certificates cmake curl dbus-daemon ffmpeg file flac gettext git libdbus-1-dev libsdl2-dev \
+      make ninja-build patch pkg-config python3 python3-dbusmock python3-fonttools python3-mutagen xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+# Pinned musl cross toolchain (SHA-256 checked by the script).
+COPY install_mips_toolchain.sh /tmp/install_mips_toolchain.sh
+RUN cd /tmp && bash /tmp/install_mips_toolchain.sh /opt/toolchains \
+ && chmod -R a+rX /opt/toolchains && rm /tmp/install_mips_toolchain.sh
+
+ENV PATH=/opt/toolchains/mipsel-linux-musl-cross/bin:$PATH
+WORKDIR /src

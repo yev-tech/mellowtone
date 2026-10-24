@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mt <mt@localhost>
+Date: Mon, 5 Oct 2026 22:05:54 +0000
+Subject: [PATCH] adapter: HiBy DiscoverType property; classic-only discovery
+ by default
+
+The R3 Pro kernel does not answer interleaved BR/EDR+LE discovery, so discovery is classic
+(BR/EDR) unless the Adapter DiscoverType property asks for LE or both.
+---
+ plugins/mgmtops.c | 29 +++++++++++++++++++++++++++--
+ src/adapter.c     | 14 ++++++++++++++
+ src/adapter.h     |  1 +
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/mgmtops.c b/plugins/mgmtops.c
+index 16a97c9..179dccd 100644
+--- a/plugins/mgmtops.c
++++ b/plugins/mgmtops.c
+@@ -69,6 +69,8 @@ static struct controller_info {
+ 	uint8_t dev_class[3];
+ 	GSList *connections;
+ 	uint8_t discov_type;
++	/* HiBy: 0 = BR_EDR (default), 1 = LE, 2 = BR_EDR_LE, 3 = other */
++	int discover_kind;
+ 
+ 	gboolean pending_uuid;
+ 	GSList *pending_uuids;
+@@ -1945,10 +1947,14 @@ static int mgmt_start_discovery(int index)
+ 
+ 	info->discov_type = 0;
+ 
+-	if (mgmt_bredr(info->current_settings))
++	/* HiBy: classic-only by default; this firmware's kernel does not
++	 * handle interleaved BR/EDR+LE discovery. LE is opt-in through the
++	 * Adapter "DiscoverType" property. */
++	if (mgmt_bredr(info->current_settings) && info->discover_kind != 1)
+ 		hci_set_bit(BDADDR_BREDR, &info->discov_type);
+ 
+-	if (mgmt_low_energy(info->current_settings)) {
++	if (mgmt_low_energy(info->current_settings) &&
++						info->discover_kind != 0) {
+ 		hci_set_bit(BDADDR_LE_PUBLIC, &info->discov_type);
+ 		hci_set_bit(BDADDR_LE_RANDOM, &info->discov_type);
+ 	}
+@@ -2471,6 +2477,24 @@ static int mgmtops_load_ltks(int index, GSList *keys)
+ 	return err;
+ }
+ 
++static int mgmt_set_discover_type(int index, const char *type)
++{
++	struct controller_info *info = &controllers[index];
++
++	DBG("hci%d, name %s", index, type);
++
++	if (g_strcmp0(type, "BR_EDR") == 0)
++		info->discover_kind = 0;
++	else if (g_strcmp0(type, "BR_EDR_LE") == 0)
++		info->discover_kind = 2;
++	else if (g_strcmp0(type, "LE") == 0)
++		info->discover_kind = 1;
++	else
++		info->discover_kind = 3;
++
++	return 0;
++}
++
+ static struct btd_adapter_ops mgmt_ops = {
+ 	.setup = mgmt_setup,
+ 	.cleanup = mgmt_cleanup,
+@@ -2478,6 +2502,7 @@ static struct btd_adapter_ops mgmt_ops = {
+ 	.set_discoverable = mgmt_set_discoverable,
+ 	.set_pairable = mgmt_set_pairable,
+ 	.start_discovery = mgmt_start_discovery,
++	.set_discover_type = mgmt_set_discover_type,
+ 	.stop_discovery = mgmt_stop_discovery,
+ 	.set_name = mgmt_set_name,
+ 	.set_dev_class = mgmt_set_dev_class,
+diff --git a/src/adapter.c b/src/adapter.c
+index f922876..106c372 100644
+--- a/src/adapter.c
++++ b/src/adapter.c
+@@ -1244,6 +1244,20 @@ static DBusMessage *set_property(DBusConnection *conn,
+ 		dbus_message_iter_get_basic(&sub, &timeout);
+ 
+ 		return set_pairable_timeout(conn, msg, timeout, data);
++	} else if (g_str_equal("DiscoverType", property)) {
++		/* HiBy: "BR_EDR" (default), "LE" or "BR_EDR_LE" */
++		struct btd_adapter *adapter = data;
++		const char *type;
++
++		if (dbus_message_iter_get_arg_type(&sub) != DBUS_TYPE_STRING)
++			return btd_error_invalid_args(msg);
++
++		dbus_message_iter_get_basic(&sub, &type);
++
++		if (adapter_ops->set_discover_type)
++			adapter_ops->set_discover_type(adapter->dev_id, type);
++
++		return dbus_message_new_method_return(msg);
+ 	}
+ 
+ 	return btd_error_invalid_args(msg);
+diff --git a/src/adapter.h b/src/adapter.h
+index b7ea62b..7e741fc 100644
+--- a/src/adapter.h
++++ b/src/adapter.h
+@@ -181,6 +181,7 @@ struct btd_adapter_ops {
+ 							uint16_t timeout);
+ 	int (*set_pairable) (int index, gboolean pairable);
+ 	int (*start_discovery) (int index);
++	int (*set_discover_type) (int index, const char *type);	/* HiBy */
+ 	int (*stop_discovery) (int index);
+ 
+ 	int (*set_name) (int index, const char *name);

@@ -1,0 +1,21 @@
+Main submenu assets (2026-09-13)
+Runtime path: <theme root>/submenu/
+Icons 44x44 RGBA, from Phosphor Icons @2.1.1 (MIT).
+Sources: folder-open, user, vinyl-record, user-square, music-notes-simple,
+playlist, arrows-clockwise, database, tag, images-square.
+SVG gradients follow the Settings/Wireless gold/cyan/mint/silver/purple/coral
+palette. Rendered via ffmpeg librsvg and Lanczos size export.
+update_database.png uses the regular arrows-clockwise glyph from
+@phosphor-icons/core 2.1.1 (assets/regular/arrows-clockwise.svg), MIT.
+music_database.png (gold) and refresh_metadata.png (coral) use the regular
+database and tag glyphs from the same package, vertical gradient, rendered at
+176px and Lanczos-scaled to 44px.
+refresh_covers.png (purple) uses the regular images-square glyph from
+@phosphor-icons/core 2.1.1 (assets/regular/images-square.svg), vertical
+gradient, rendered at 176px and Lanczos-scaled to 44px.
+Saved backgrounds reuse the generated Settings and Wireless gradients.
+Rows retain decoded images for their lifetime. No runtime gradient generation.
+
+genres.png uses the regular tag glyph from @phosphor-icons/core 2.1.1
+(assets/regular/tag.svg), coral vertical gradient (#ffb4a2 to #ee7c83),
+rendered at 176px and Lanczos-scaled to 44px. See LICENSE for MIT terms.

@@ -1,0 +1,9 @@
+# Noto fonts installed in /usr/mellowtone/fonts/ by the image recipe (full mode):
+# sha256, file name. These are the files the bundle install has in
+# /data/mellowtone/fonts/ (Noto Sans subset to Latin/Greek/Cyrillic, Noto Sans
+# Hebrew; SIL Open Font License 1.1). Pass their directory with --fonts DIR.
+3651f55a9df6470174c1d5329f11fc17ef54202ff74262beb33f247e9c5569e3 NotoSans-Regular.ttf
+48648625248fe9792869d8125226a92b1b86d6cf6af3325a17a82508471078ca NotoSans-Medium.ttf
+cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a NotoSans-OFL.txt
+cdefaf8efd47045f6820928eba84db5bed7557539328952b5f828315485e02ee NotoSansHebrew-Regular.ttf
+e08036dbb38d9e7a033a721e0ca60befde2ed9d1a8075922dbd3429093dd793b OFL-NotoSansHebrew.txt

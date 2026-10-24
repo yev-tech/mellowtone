@@ -1,0 +1,448 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mt <mt@localhost>
+Date: Mon, 5 Oct 2026 22:05:54 +0000
+Subject: [PATCH] audio/unix: HiBy ALSA-plugin IPC
+
+- 10-byte BT_SET_CONFIGURATION response with the link MTU (the plugin's LDAC loop spins without it).
+- START/STOP indications to clients.
+- Publish /tmp/bt_a2dp_stream (codec and rate), also for streams the headset configured.
+---
+ audio/unix.c | 334 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ audio/unix.h |   3 +
+ 2 files changed, 335 insertions(+), 2 deletions(-)
+
+diff --git a/audio/unix.c b/audio/unix.c
+index 9a10764..5ace7b8 100644
+--- a/audio/unix.c
++++ b/audio/unix.c
+@@ -52,6 +52,7 @@
+ #include "source.h"
+ #include "gateway.h"
+ #include "unix.h"
++#include "hiby-codecs.h"
+ 
+ #define check_nul(str) (str[sizeof(str) - 1] == '\0')
+ 
+@@ -517,6 +518,26 @@ static void print_sbc(struct sbc_codec_cap *sbc)
+ 		sbc->min_bitpool, sbc->max_bitpool);
+ }
+ 
++/* HiBy: IPC source type for a vendor codec (sink = +1), 0 if unknown */
++static uint8_t hiby_vendor_type(struct avdtp_media_codec_capability *codec_cap)
++{
++	a2dp_vendor_codec_t *vc = (void *) codec_cap->data;
++	uint32_t vid = btohl(vc->vendor_id);
++	uint16_t cid = btohs(vc->codec_id);
++
++	if (vid == APTX_VENDOR_ID && cid == APTX_CODEC_ID)
++		return BT_A2DP_APTX_SOURCE;
++	if (vid == LDAC_VENDOR_ID && cid == LDAC_CODEC_ID)
++		return BT_A2DP_LDAC_SOURCE;
++	if (vid == UAT_VENDOR_ID && cid == UAT_CODEC_ID)
++		return BT_A2DP_UAT_SOURCE;
++	if (vid == UAT_VENDOR_ID && cid == UAT_TWS_CODEC_ID)
++		return BT_A2DP_UAT_TWS_SOURCE;
++	return 0;
++}
++
++static void write_stream_info(struct audio_device *dev, GSList *caps);
++
+ static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
+ 				struct avdtp_service_capability *cap,
+ 				uint8_t seid,
+@@ -583,6 +604,60 @@ static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
+ 		mpeg->bitrate = mpeg_cap->bitrate;
+ 
+ 		print_mpeg12(mpeg_cap);
++	} else if (codec_cap->media_codec_type == A2DP_CODEC_MPEG24 &&
++				cap->length >= 2 + 6) {
++		/* HiBy: AAC, 6 raw codec-info bytes */
++		aac_capabilities_t *aac = (void *) codec;
++
++		if (space_left < sizeof(aac_capabilities_t))
++			return -ENOMEM;
++
++		if (type == AVDTP_SEP_TYPE_SINK)
++			codec->type = BT_A2DP_MPEG24_SINK;
++		else if (type == AVDTP_SEP_TYPE_SOURCE)
++			codec->type = BT_A2DP_MPEG24_SOURCE;
++		else
++			return -EINVAL;
++
++		codec->length = sizeof(aac_capabilities_t);
++		memcpy(aac->data, codec_cap->data, sizeof(aac->data));
++
++		DBG("Append AAC %02X %02X %02X %02X %02X %02X", aac->data[0],
++				aac->data[1], aac->data[2], aac->data[3],
++				aac->data[4], aac->data[5]);
++	} else if (codec_cap->media_codec_type == A2DP_CODEC_VENDOR &&
++				cap->length >= 2 + 6 + 1 &&
++				hiby_vendor_type(codec_cap) != 0) {
++		/* HiBy: aptX / LDAC / UAT / UAT-TWS, 2 config bytes */
++		a2dp_vendor_codec_t *vc = (void *) codec_cap->data;
++		uint8_t *cfg = codec_cap->data + sizeof(*vc);
++		uint8_t base = hiby_vendor_type(codec_cap);
++
++		if (space_left < sizeof(codec_capabilities_t) + 2)
++			return -ENOMEM;
++
++		if (type == AVDTP_SEP_TYPE_SINK)
++			codec->type = base + 1;
++		else if (type == AVDTP_SEP_TYPE_SOURCE)
++			codec->type = base;
++		else
++			return -EINVAL;
++
++		codec->length = sizeof(codec_capabilities_t) + 2;
++
++		if (base == BT_A2DP_APTX_SOURCE) {
++			codec->data[0] = cfg[0] & 0x0f;	/* channel mode */
++			codec->data[1] = cfg[0] >> 4;	/* frequency */
++		} else {
++			if (cap->length < 2 + 6 + 2)
++				return -EINVAL;
++			codec->data[0] = cfg[0];
++			codec->data[1] = cfg[1];
++		}
++
++		DBG("Append vendor codec %04X:%04X type 0x%02X cfg %02X %02X",
++				btohl(vc->vendor_id), btohs(vc->codec_id),
++				codec->type, codec->data[0], codec->data[1]);
+ 	} else {
+ 		size_t codec_length, type_length, total_length;
+ 
+@@ -620,6 +695,38 @@ static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
+ 	return 0;
+ }
+ 
++/* A client that holds the A2DP write lock without streaming is stale when
++ * another client asks for the endpoint: e.g. the stock player was killed
++ * but its plugin socket lives on in a child that inherited the fd (adbd
++ * started from the player), so client_free() never runs and the lock is
++ * never released. HiBy's plugin skips locked endpoints, so the next player
++ * sees no usable codec at all. One player runs at a time: the newest
++ * opener wins, unless the holder is actively streaming. */
++static void release_stale_a2dp_locks(struct unix_client *self,
++						struct a2dp_sep *sep)
++{
++	GSList *cl;
++
++	if (!sep || !a2dp_sep_get_lock(sep) || a2dp_sep_is_streaming(sep))
++		return;
++
++	for (cl = clients; cl; cl = cl->next) {
++		struct unix_client *c = cl->data;
++		struct a2dp_data *ca = &c->d.a2dp;
++
++		if (c == self || (c->type != TYPE_SINK &&
++						c->type != TYPE_SOURCE))
++			continue;
++		if (ca->sep != sep)
++			continue;
++
++		info("Releasing stale A2DP lock held by client %p", c);
++		a2dp_sep_unlock(ca->sep, ca->session);
++		ca->sep = NULL;
++		c->lock = 0;
++	}
++}
++
+ static void a2dp_discovery_complete(struct avdtp *session, GSList *seps,
+ 					struct avdtp_error *err,
+ 					void *user_data)
+@@ -678,6 +785,10 @@ static void a2dp_discovery_complete(struct avdtp *session, GSList *seps,
+ 				cap = avdtp_stream_get_codec(stream);
+ 		}
+ 
++		if (stream)
++			release_stale_a2dp_locks(client,
++					a2dp_get_sep(session, stream));
++
+ 		for (cl = clients; cl; cl = cl->next) {
+ 			struct unix_client *c = cl->data;
+ 			struct a2dp_data *ca2dp = &c->d.a2dp;
+@@ -692,6 +803,15 @@ static void a2dp_discovery_complete(struct avdtp *session, GSList *seps,
+ 		if (sep && a2dp_sep_get_lock(sep))
+ 			lock = BT_WRITE_LOCK;
+ 
++		/* A stream the remote configured (headphones that connect on
++		 * their own pick the rate) never passes a2dp_config_complete():
++		 * publish it here, or the player keeps the last rate. */
++		if (stream) {
++			GSList one = { avdtp_stream_get_codec(stream), NULL };
++
++			write_stream_info(client->dev, &one);
++		}
++
+ 		a2dp_append_codec(rsp, cap, seid, type, configured, lock);
+ 	}
+ 
+@@ -713,6 +833,89 @@ failed:
+ 	a2dp->stream = NULL;
+ }
+ 
++/* Publish the negotiated A2DP stream (codec, sample rate, channels, peer) to
++ * /tmp/bt_a2dp_stream so a player that feeds HiBy's ALSA plugin (which does
++ * no rate conversion) can resample to the rate the sink actually accepted. */
++#define A2DP_STREAM_INFO_PATH "/tmp/bt_a2dp_stream"
++
++static void write_stream_info(struct audio_device *dev, GSList *caps)
++{
++	const char *codec = "unknown";
++	unsigned int rate = 0, channels = 2;
++	char addr[18], tmp[] = A2DP_STREAM_INFO_PATH ".tmp";
++	FILE *f;
++
++	for (; caps; caps = g_slist_next(caps)) {
++		struct avdtp_service_capability *cap = caps->data;
++		struct avdtp_media_codec_capability *mc;
++		const uint8_t *d;
++		int n;
++
++		if (cap->category != AVDTP_MEDIA_CODEC)
++			continue;
++		mc = (void *) cap->data;
++		d = mc->data;
++		n = cap->length - sizeof(*mc);
++
++		if (mc->media_codec_type == A2DP_CODEC_SBC && n >= 1) {
++			codec = "SBC";
++			rate = (d[0] & 0x10) ? 48000 : (d[0] & 0x20) ? 44100 :
++				(d[0] & 0x40) ? 32000 : 16000;
++			channels = (d[0] & 0x08) ? 1 : 2;
++		} else if (mc->media_codec_type == A2DP_CODEC_MPEG24 && n >= 3) {
++			static const unsigned int lo[] = { 8000, 11025, 12000,
++				16000, 22050, 24000, 32000, 44100 };
++			static const unsigned int hi[] = { 48000, 64000, 88200,
++				96000 };
++			int i;
++
++			codec = "AAC";
++			for (i = 0; i < 8; i++)
++				if (d[1] & (0x80 >> i))
++					rate = lo[i];
++			for (i = 0; i < 4; i++)
++				if (d[2] & (0x80 >> i))
++					rate = hi[i];
++			channels = (d[2] & 0x08) ? 1 : 2;
++		} else if (mc->media_codec_type == A2DP_CODEC_VENDOR &&
++								n >= 7) {
++			const a2dp_vendor_codec_t *vc = (const void *) d;
++			uint32_t vid = btohl(vc->vendor_id);
++			uint16_t cid = btohs(vc->codec_id);
++
++			if (vid == LDAC_VENDOR_ID && cid == LDAC_CODEC_ID) {
++				codec = "LDAC";
++				rate = (d[6] & 0x01) ? 192000 :
++					(d[6] & 0x02) ? 176400 :
++					(d[6] & 0x04) ? 96000 :
++					(d[6] & 0x08) ? 88200 :
++					(d[6] & 0x10) ? 48000 : 44100;
++				channels = (n >= 8 && (d[7] & 0x04)) ? 1 : 2;
++			} else if (vid == APTX_VENDOR_ID &&
++						cid == APTX_CODEC_ID) {
++				codec = "aptX";
++				rate = (d[6] & 0x10) ? 48000 : (d[6] & 0x20) ?
++					44100 : (d[6] & 0x40) ? 32000 : 16000;
++			} else if (vid == UAT_VENDOR_ID) {
++				codec = cid == UAT_TWS_CODEC_ID ? "UAT_TWS" :
++									"UAT";
++			}
++		}
++		break;
++	}
++
++	ba2str(&dev->dst, addr);
++	f = fopen(tmp, "w");
++	if (!f)
++		return;
++	fprintf(f, "addr=%s codec=%s rate=%u channels=%u\n", addr, codec,
++							rate, channels);
++	fclose(f);
++	if (rename(tmp, A2DP_STREAM_INFO_PATH) < 0)
++		unlink(tmp);
++	DBG("stream info: %s %s %u Hz %u ch", addr, codec, rate, channels);
++}
++
+ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
+ 					struct avdtp_stream *stream,
+ 					struct avdtp_error *err,
+@@ -754,6 +957,10 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
+ 
+ 	/* FIXME: Use imtu when fd_opt is CFG_FD_OPT_READ */
+ 	rsp->link_mtu = omtu;
++	rsp->imtu = imtu;
++	rsp->omtu = omtu;
++
++	write_stream_info(client->dev, caps);
+ 
+ 	unix_ipc_sendmsg(client, &rsp->h);
+ 
+@@ -1002,6 +1209,37 @@ failed:
+ 	unix_ipc_error(client, BT_OPEN, EINVAL);
+ }
+ 
++/* HiBy: vendor codec (LDAC/UAT) param change on an open stream of the same
++ * SEP -> AVDTP RECONFIGURE in place instead of close/reopen. */
++static gboolean hiby_wants_inplace_reconf(struct a2dp_sep *sep, GSList *caps)
++{
++	struct avdtp_stream *stream;
++	GSList *l;
++
++	if (!sep)
++		return FALSE;
++
++	stream = a2dp_sep_get_stream(sep);
++	if (!stream)
++		return FALSE;
++
++	for (l = caps; l != NULL; l = g_slist_next(l)) {
++		struct avdtp_service_capability *cap = l->data;
++		struct avdtp_media_codec_capability *codec = (void *) cap->data;
++
++		if (cap->category != AVDTP_MEDIA_CODEC)
++			continue;
++		if (codec->media_codec_type != A2DP_CODEC_VENDOR)
++			return FALSE;
++		break;
++	}
++
++	if (l == NULL)
++		return FALSE;
++
++	return !avdtp_stream_has_capabilities(stream, caps);
++}
++
+ static void start_config(struct audio_device *dev, struct unix_client *client)
+ {
+ 	struct a2dp_data *a2dp;
+@@ -1026,8 +1264,18 @@ static void start_config(struct audio_device *dev, struct unix_client *client)
+ 			goto failed;
+ 		}
+ 
+-		id = a2dp_config(a2dp->session, a2dp->sep, a2dp_config_complete,
+-					client->caps, client);
++		id = 0;
++		if (hiby_wants_inplace_reconf(a2dp->sep, client->caps)) {
++			id = a2dp_reconfig(a2dp->session, a2dp->sep,
++						a2dp_config_complete,
++						client->caps, client);
++			if (id)
++				DBG("in-place reconfigure");
++		}
++		if (id == 0)
++			id = a2dp_config(a2dp->session, a2dp->sep,
++						a2dp_config_complete,
++						client->caps, client);
+ 		client->cancel = a2dp_cancel;
+ 		break;
+ 
+@@ -1534,6 +1782,55 @@ static int handle_a2dp_transport(struct unix_client *client,
+ 							sizeof(sbc_cap));
+ 
+ 		print_sbc(&sbc_cap);
++	} else if (req->codec.type == BT_A2DP_MPEG24_SINK ||
++			req->codec.type == BT_A2DP_MPEG24_SOURCE) {
++		/* HiBy: AAC */
++		aac_capabilities_t *aac = (void *) &req->codec;
++		uint8_t info[8] = { 0x00, A2DP_CODEC_MPEG24 };
++
++		memcpy(info + 2, aac->data, sizeof(aac->data));
++		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, info,
++								sizeof(info));
++		DBG("Trans AAC");
++	} else if (req->codec.type == BT_A2DP_APTX_SINK ||
++			req->codec.type == BT_A2DP_APTX_SOURCE) {
++		uint8_t info[9] = { 0x00, A2DP_CODEC_VENDOR,
++					0x4f, 0x00, 0x00, 0x00, 0x01, 0x00 };
++
++		/* data[0] = channel mode (low nibble), data[1] = frequency */
++		info[8] = (req->codec.data[0] & 0x0f) |
++				(req->codec.data[1] & 0x0f) << 4;
++		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, info,
++								sizeof(info));
++		DBG("Trans APTX");
++	} else if (req->codec.type == BT_A2DP_LDAC_SINK ||
++			req->codec.type == BT_A2DP_LDAC_SOURCE ||
++			req->codec.type == BT_A2DP_UAT_SINK ||
++			req->codec.type == BT_A2DP_UAT_SOURCE ||
++			req->codec.type == BT_A2DP_UAT_TWS_SINK ||
++			req->codec.type == BT_A2DP_UAT_TWS_SOURCE) {
++		uint8_t info[10] = { 0x00, A2DP_CODEC_VENDOR };
++		a2dp_vendor_codec_t *vc = (void *) &info[2];
++
++		if (req->codec.type == BT_A2DP_LDAC_SINK ||
++				req->codec.type == BT_A2DP_LDAC_SOURCE) {
++			vc->vendor_id = htobl(LDAC_VENDOR_ID);
++			vc->codec_id = htobs(LDAC_CODEC_ID);
++			DBG("Trans LDAC");
++		} else {
++			vc->vendor_id = htobl(UAT_VENDOR_ID);
++			vc->codec_id = htobs((req->codec.type ==
++						BT_A2DP_UAT_SINK ||
++					req->codec.type == BT_A2DP_UAT_SOURCE) ?
++					UAT_CODEC_ID : UAT_TWS_CODEC_ID);
++			DBG("Trans UAT");
++		}
++		info[8] = req->codec.data[0];
++		info[9] = req->codec.data[1];
++		DBG("vendor cfg requested by client: %02X %02X",
++					info[8], info[9]);
++		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, info,
++								sizeof(info));
+ 	} else
+ 		return -EINVAL;
+ 
+@@ -1852,6 +2149,39 @@ void unix_delay_report(struct audio_device *dev, uint8_t seid, uint16_t delay)
+ 	}
+ }
+ 
++/* HiBy: tell player clients when the remote starts/suspends the stream
++ * (BT_INDICATION, BT_START_STREAM / BT_STOP_STREAM, header only). */
++static void unix_send_stream_ind(struct audio_device *dev, uint8_t name)
++{
++	char buf[BT_SUGGESTED_BUFFER_SIZE];
++	bt_audio_msg_header_t *msg = (void *) buf;
++	GSList *l;
++
++	memset(buf, 0, sizeof(buf));
++	msg->type = BT_INDICATION;
++	msg->name = name;
++	msg->length = sizeof(*msg);
++
++	for (l = clients; l != NULL; l = g_slist_next(l)) {
++		struct unix_client *client = l->data;
++
++		if (client->dev == dev)
++			unix_ipc_sendmsg(client, msg);
++	}
++}
++
++void unix_start_ind(struct audio_device *dev)
++{
++	DBG("unix_start_ind(%p)", dev);
++	unix_send_stream_ind(dev, BT_START_STREAM);
++}
++
++void unix_suspend_ind(struct audio_device *dev)
++{
++	DBG("unix_suspend_ind(%p)", dev);
++	unix_send_stream_ind(dev, BT_STOP_STREAM);
++}
++
+ int unix_init(void)
+ {
+ 	GIOChannel *io;
+diff --git a/audio/unix.h b/audio/unix.h
+index 74ca16d..6c2a2c0 100644
+--- a/audio/unix.h
++++ b/audio/unix.h
+@@ -26,5 +26,8 @@ void unix_device_removed(struct audio_device *dev);
+ 
+ void unix_delay_report(struct audio_device *dev, uint8_t seid, uint16_t delay);
+ 
++void unix_start_ind(struct audio_device *dev);
++void unix_suspend_ind(struct audio_device *dev);
++
+ int unix_init(void);
+ void unix_exit(void);

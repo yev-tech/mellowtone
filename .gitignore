@@ -1,0 +1,156 @@
+# In-tree dependency clones left by the old Makefile. CMake no longer uses
+# them: dependencies are pinned archives fetched into build/<preset>/_deps
+# (cmake/dependencies.cmake).
+/lvgl
+/dr_libs
+/tinyalsa
+/faad2
+/alac
+/mbedtls
+/cJSON
+/dbus
+/opus
+/lua
+/libexecinfo
+/jpeg
+
+# Our UI assets (assets/themes/). Everything tracked here ships: on the R1,
+# R3 Pro II and R3 II 2025 boards/common/repack_upt.sh copies it over the stock
+# firmware's own /usr/resource/litegui/theme2/; on the R3 Pro
+# boards/r3pro/tools/make_theme.sh builds <install_root>/themes/ from it. So a
+# tracked file is exactly a shipped file.
+#
+# Stock HiBy graphics are proprietary and never redistributed (see README.md's
+# own note). Populate those locally from your own device/firmware dump; the
+# blanket exclude below keeps them from being committed by accident.
+#
+# Everything re-included below is this project's own work, each directory
+# carrying its own SOURCES.txt recording the upstream icon set and license
+# (Phosphor MIT, Lucide ISC), the generator script that draws it, or
+# confirmed absence from a genuine stock dump. Excluding everything first,
+# then re-including specific paths one directory level at a time -- git won't
+# apply a file-level negation inside a directory that is still itself
+# excluded, so each level needs its own `!` before the next.
+/assets/themes/*
+
+# Wholly ours, minus the stock files that happen to share the directory.
+!/assets/themes/power_action/
+# Player layout XML files (src/ui/player_layouts.c scans this directory).
+!/assets/themes/player_layouts/
+# Quick drawer: only the line glyphs drawn by boards/r3pro/tools/gen_drawer_icons.py.
+# The round toggle buttons the drawer keeps hidden come from the stock theme.
+!/assets/themes/pull_down/
+/assets/themes/pull_down/*
+!/assets/themes/pull_down/m_*.png
+!/assets/themes/topbar/
+/assets/themes/topbar/*
+!/assets/themes/topbar/lucide_*.png
+!/assets/themes/topbar/LUCIDE_SOURCES.txt
+!/assets/themes/topbar/SOURCES.txt
+# Status bar glyphs drawn by boards/r3pro/tools/gen_drawer_icons.py.
+!/assets/themes/topbar/m_*.png
+# Per-network Wi-Fi signal bars, built as topbar/wifi_connect_<level>.png by
+# gui_network.c. Phosphor wifi-*-fill redraws (see SOURCES.txt), byte-different
+# from the stock files of the same name.
+!/assets/themes/topbar/wifi_connect_0.png
+!/assets/themes/topbar/wifi_connect_1.png
+!/assets/themes/topbar/wifi_connect_2.png
+!/assets/themes/topbar/wifi_connect_3.png
+!/assets/themes/boot_animation/
+/assets/themes/boot_animation/*
+!/assets/themes/boot_animation/en/
+/assets/themes/boot_animation/en/*
+!/assets/themes/boot_animation/en/0.png
+!/assets/themes/boot_animation/en/0.jpg
+!/assets/themes/boot_animation/en/config.ini
+!/assets/themes/boot_animation/en/push.bat
+# Drawn by tools/assets/generate_stream_media_icons.py (SOURCES.txt).
+!/assets/themes/stream_media/
+/assets/themes/stream_media/*
+!/assets/themes/stream_media/download.png
+!/assets/themes/stream_media/subsonic_row.png
+!/assets/themes/stream_media/subsonic_row_s.png
+!/assets/themes/stream_media/SOURCES.txt
+!/assets/themes/playing_plane/
+/assets/themes/playing_plane/*
+# Transport buttons drawn for this project, deliberately kept under the stock
+# filenames so they drop straight into the existing asset path and both the
+# player screen and the quick drawer pick them up with no code change. Both
+# are byte-different from the same-named files in a genuine stock dump. The
+# rest of this directory is stock artwork and stays excluded.
+!/assets/themes/playing_plane/btn_play.png
+!/assets/themes/playing_plane/btn_pause.png
+# Accent-recolored glyph in the player's quality pill (gui_player.c). Drawn
+# for this project and absent from a genuine stock dump entirely.
+!/assets/themes/playing_plane/quality_waveform.png
+# Wireless list icons (LIST_SOURCES.txt). Everything else in a stock
+# wireless/ directory stays excluded.
+!/assets/themes/wireless/
+/assets/themes/wireless/*
+!/assets/themes/wireless/list_*.png
+!/assets/themes/wireless/LIST_SOURCES.txt
+/assets/themes/wireless/list_bg_*.png
+
+# Wholly ours: this directory does not exist at all in a genuine stock dump
+# (diffed directly against one), and carries its own SOURCES.txt + LICENSE
+# (Phosphor Icons, MIT). Music submenu and library maintenance icons.
+!/assets/themes/submenu/
+
+# Home shortcut icons (SOURCES.txt): Phosphor redraws swapped in place, each
+# byte-different from the stock file of the same name, plus radio.png from
+# boards/r3pro/tools/gen_drawer_icons.py. The rest of a stock launcher/ directory
+# stays excluded.
+!/assets/themes/launcher/
+/assets/themes/launcher/*
+!/assets/themes/launcher/SOURCES.txt
+!/assets/themes/launcher/music.png
+!/assets/themes/launcher/stream_media.png
+!/assets/themes/launcher/sys_set.png
+!/assets/themes/launcher/radio.png
+
+# Settings category rows. Mixed directory: the icons are ours
+# (CATEGORY_SOURCES.txt + CATEGORY_LICENSE.txt, Phosphor Icons MIT), absent
+# from a genuine stock dump entirely. Everything else here (bt, color_*,
+# cursor, gain_*, lo, po, on/off, progress) is stock and stays excluded.
+!/assets/themes/settings/
+/assets/themes/settings/*
+!/assets/themes/settings/CATEGORY_SOURCES.txt
+!/assets/themes/settings/CATEGORY_LICENSE.txt
+!/assets/themes/settings/display.png
+!/assets/themes/settings/power.png
+!/assets/themes/settings/system.png
+!/assets/themes/settings/sound.png
+!/assets/themes/settings/playback.png
+!/assets/themes/settings/library.png
+
+# Korean.ttf-derived host-simulator font: excluded, unlike the rest of
+# assets/fonts/, because this particular file's own embedded metadata
+# doesn't state a license (see assets/fonts/NOTICE.md). Populate locally
+# from your own device dump (/usr/resource/fonts/Korean.ttf, subsetted to
+# U+1100-11FF,U+3130-318F,U+AC00-D7A3) if you want Korean text to render in
+# the host simulator's (./mt build host) -- on target this is a non-issue, the real device
+# build reads Korean.ttf directly from the stock firmware at runtime.
+/assets/fonts/korean.ttf
+
+# Build outputs (./mt build <board>|host: build/<preset>/; ./mt image and
+# ./mt bluez: out/)
+/build/
+/out/
+/compile_commands.json
+/compile_flags.txt
+
+# Mellowtone build tooling
+/.mt.local
+/.bluez-dev/
+# Local work area of the boards/common/base-image/build_base_*.sh recipes (sources, stages)
+/scratch/
+
+# Host simulator state and its card (./music is the simulated SD card)
+/music/
+/.mellowtone/
+/settings.txt*
+/Radio.txt
+
+# Python caches
+__pycache__/
+*.pyc

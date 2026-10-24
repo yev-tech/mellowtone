@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# udhcpc hook: Mellowtone's custom DNS servers (Settings > Wi-Fi > DNS
+# Settings) replace the ones from the lease, on every bound and renew.
+#
+# The player writes the servers, one per line, to /tmp/mellowtone_dns at
+# start (from its config on the SD card) and whenever they change; no file
+# means the lease's servers stay.
+#
+
+CUSTOM=/tmp/mellowtone_dns
+RESOLV_CONF=/etc/resolv.conf
+
+case "$1" in
+    bound|renew) ;;
+    *) exit 0 ;;
+esac
+[ -s "$CUSTOM" ] || exit 0
+
+# resolv.conf may be a symlink to /tmp/, so rewrite it in place.
+TMPFILE=$(mktemp) || exit 0
+grep -v '^nameserver' "$RESOLV_CONF" > "$TMPFILE" 2>/dev/null
+while read -r server; do
+    [ -n "$server" ] && echo "nameserver $server # $interface" >> "$TMPFILE"
+done < "$CUSTOM"
+cat "$TMPFILE" > "$RESOLV_CONF"
+rm -f "$TMPFILE"
+exit 0

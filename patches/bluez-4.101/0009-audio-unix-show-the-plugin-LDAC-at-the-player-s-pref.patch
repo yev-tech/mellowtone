@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yev-tech <347553623+yev-tech@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 22:18:57 -0400
+Subject: [PATCH] audio/unix: show the plugin LDAC at the player's preferred
+ rate
+
+HiBy's ALSA plugin configures LDAC at the highest rate in the remote's
+capabilities, 96 kHz, which stutters on the single X1000 core. Report a
+remote LDAC endpoint's rates as the preferred rate (44.1 kHz by default)
+when the remote supports it, so the plugin configures that.
+---
+ audio/a2dp.c | 13 +++++++++++++
+ audio/a2dp.h |  2 ++
+ audio/unix.c | 11 +++++++++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/audio/a2dp.c b/audio/a2dp.c
+index afadd45..b96f5b2 100644
+--- a/audio/a2dp.c
++++ b/audio/a2dp.c
+@@ -2301,6 +2301,19 @@ static unsigned int hiby_preferred_rate(void)
+ 	return rate;
+ }
+ 
++uint8_t a2dp_hiby_ldac_rate_mask(void)
++{
++	switch (hiby_preferred_rate()) {
++	case 44100:
++		return 0x20;
++	case 48000:
++		return 0x10;
++	case 96000:
++		return 0x04;
++	}
++	return 0;
++}
++
+ /* Build our configuration for a remote AAC/vendor codec. 'r' is the remote
+  * media-codec info (media type, codec, ...). Returns length or 0. */
+ static size_t hiby_select_params(const uint8_t *r, size_t rlen, uint8_t *out)
+diff --git a/audio/a2dp.h b/audio/a2dp.h
+index 2ccb3f4..cf81c94 100644
+--- a/audio/a2dp.h
++++ b/audio/a2dp.h
+@@ -202,6 +202,8 @@ gboolean a2dp_sep_lock(struct a2dp_sep *sep, struct avdtp *session);
+ gboolean a2dp_sep_unlock(struct a2dp_sep *sep, struct avdtp *session);
+ gboolean a2dp_sep_get_lock(struct a2dp_sep *sep);
+ gboolean a2dp_sep_is_streaming(struct a2dp_sep *sep);
++/* HiBy: LDAC frequency bit of the player's preferred rate, 0 if none */
++uint8_t a2dp_hiby_ldac_rate_mask(void);
+ struct avdtp_stream *a2dp_sep_get_stream(struct a2dp_sep *sep);
+ struct a2dp_sep *a2dp_get_sep(struct avdtp *session,
+ 				struct avdtp_stream *stream);
+diff --git a/audio/unix.c b/audio/unix.c
+index 5ace7b8..a8231e7 100644
+--- a/audio/unix.c
++++ b/audio/unix.c
+@@ -653,6 +653,17 @@ static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
+ 				return -EINVAL;
+ 			codec->data[0] = cfg[0];
+ 			codec->data[1] = cfg[1];
++			/* The plugin picks the highest LDAC rate it is shown,
++			 * 96 kHz, which stutters on the X1000. Show a remote
++			 * endpoint's LDAC rates as the player's preferred rate
++			 * when the remote supports it. */
++			if (!configured && btohl(vc->vendor_id) == LDAC_VENDOR_ID &&
++					btohs(vc->codec_id) == LDAC_CODEC_ID) {
++				uint8_t mask = a2dp_hiby_ldac_rate_mask();
++
++				if (mask && (codec->data[0] & mask))
++					codec->data[0] &= mask;
++			}
+ 		}
+ 
+ 		DBG("Append vendor codec %04X:%04X type 0x%02X cfg %02X %02X",

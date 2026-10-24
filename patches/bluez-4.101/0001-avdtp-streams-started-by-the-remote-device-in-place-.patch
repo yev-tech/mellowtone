@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mt <mt@localhost>
+Date: Mon, 5 Oct 2026 22:05:53 +0000
+Subject: [PATCH] avdtp: streams started by the remote device, in-place
+ reconfigure, receiver gate
+
+- Accept AVDTP streams the headset or car initiates.
+- Outgoing in-place RECONFIGURE: correct packet layout, no Media Transport, a real response handler.
+- Vendor codec fields and helpers used by the HiBy codec endpoints (0004).
+- Receiver gate: GET_CAPABILITIES/SET_CONFIGURATION on local sink endpoints are refused
+  when /dev/sa-config reports the receiver as off.
+---
+ audio/avdtp.c | 251 +++++++++++++++++++++++++++++++++++++++++++++++---
+ audio/avdtp.h |   5 +
+ 2 files changed, 242 insertions(+), 14 deletions(-)
+
+diff --git a/audio/avdtp.c b/audio/avdtp.c
+index 041abc3..5d10ab5 100644
+--- a/audio/avdtp.c
++++ b/audio/avdtp.c
+@@ -27,6 +27,8 @@
+ #endif
+ 
+ #include <stdlib.h>
++#include <sys/ioctl.h>
++#include <fcntl.h>
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <errno.h>
+@@ -53,6 +55,7 @@
+ #include "manager.h"
+ #include "control.h"
+ #include "avdtp.h"
++#include "hiby-codecs.h"
+ #include "btio.h"
+ #include "sink.h"
+ #include "source.h"
+@@ -93,6 +96,7 @@
+ #define ABORT_TIMEOUT 2
+ #define DISCONNECT_TIMEOUT 1
+ #define STREAM_TIMEOUT 20
++#define START_TIMEOUT 1
+ 
+ #if __BYTE_ORDER == __LITTLE_ENDIAN
+ 
+@@ -340,6 +344,8 @@ struct avdtp_local_sep {
+ 	struct avdtp_stream *stream;
+ 	struct seid_info info;
+ 	uint8_t codec;
++	uint32_t vendor_id;	/* HiBy: vendor codec id when codec == 0xFF */
++	uint16_t codec_id;
+ 	gboolean delay_reporting;
+ 	GSList *caps;
+ 	struct avdtp_sep_ind *ind;
+@@ -380,6 +386,7 @@ struct avdtp_stream {
+ 	gboolean delay_reporting;
+ 	uint16_t delay;		/* AVDTP 1.3 Delay Reporting feature */
+ 	gboolean starting;	/* only valid while sep state == OPEN */
++	guint start_timer;	/* Wait for remote START (backport) */
+ };
+ 
+ /* Structure describing an AVDTP connection between two devices */
+@@ -793,6 +800,9 @@ static void stream_free(struct avdtp_stream *stream)
+ 	if (stream->timer)
+ 		g_source_remove(stream->timer);
+ 
++	if (stream->start_timer)
++		g_source_remove(stream->start_timer);
++
+ 	if (stream->io)
+ 		close_stream(stream);
+ 
+@@ -1068,13 +1078,15 @@ static void avdtp_sep_set_state(struct avdtp *session,
+ 		break;
+ 	case AVDTP_STATE_OPEN:
+ 		stream->starting = FALSE;
+-		if ((old_state > AVDTP_STATE_OPEN && session->auto_dc) ||
+-							stream->open_acp)
+-			stream->idle_timer = g_timeout_add_seconds(STREAM_TIMEOUT,
+-								stream_timeout,
+-								stream);
++		/* Backport of upstream 9d656c7 ("AVDTP: Remove auto_dc flag"):
++		 * do not arm an idle timer that CLOSEs a remote-opened stream
++		 * after STREAM_TIMEOUT; car head units abort+disconnect on it. */
+ 		break;
+ 	case AVDTP_STATE_STREAMING:
++		if (stream->start_timer) {
++			g_source_remove(stream->start_timer);
++			stream->start_timer = 0;
++		}
+ 		if (stream->idle_timer) {
+ 			g_source_remove(stream->idle_timer);
+ 			stream->idle_timer = 0;
+@@ -1083,6 +1095,10 @@ static void avdtp_sep_set_state(struct avdtp *session,
+ 		break;
+ 	case AVDTP_STATE_CLOSING:
+ 	case AVDTP_STATE_ABORTING:
++		if (stream->start_timer) {
++			g_source_remove(stream->start_timer);
++			stream->start_timer = 0;
++		}
+ 		if (stream->idle_timer) {
+ 			g_source_remove(stream->idle_timer);
+ 			stream->idle_timer = 0;
+@@ -1308,6 +1324,29 @@ struct avdtp_remote_sep *avdtp_find_remote_sep(struct avdtp *session,
+ 		if (codec_data->media_codec_type != lsep->codec)
+ 			continue;
+ 
++		/* HiBy: vendor codecs must also match vendor/codec id and be
++		 * a configuration we can actually use. */
++		if (lsep->codec == A2DP_CODEC_VENDOR) {
++			a2dp_vendor_codec_t *vc = (void *) codec_data->data;
++
++			if (cap->length < 2 + sizeof(*vc))
++				continue;
++
++			DBG("match test: local_vid=%X local_cid=%X <-> "
++				"remote_vid=%X remote_cid=%X", lsep->vendor_id,
++				lsep->codec_id, btohl(vc->vendor_id),
++				btohs(vc->codec_id));
++
++			if (btohl(vc->vendor_id) != lsep->vendor_id ||
++					btohs(vc->codec_id) != lsep->codec_id)
++				continue;
++
++			if (!a2dp_codec_support(codec_data)) {
++				DBG("remote vendor codec not supported");
++				continue;
++			}
++		}
++
+ 		if (sep->stream == NULL)
+ 			return sep;
+ 	}
+@@ -1397,6 +1436,35 @@ static gboolean avdtp_discover_cmd(struct avdtp *session, uint8_t transaction,
+ 	return ret;
+ }
+ 
++/*
++ * HiBy: Bluetooth receiver (A2DP sink) mode is gated by a system setting read
++ * from /dev/sa-config. When it can be read and is 0 (receiver disabled), remote
++ * GET_CAPABILITIES / SET_CONFIGURATION on our sink SEPs are refused with
++ * BAD_STATE. If it can't be read, allow (as stock).
++ */
++#define SA_CONFIG_GET_BT_SOURCE_CFG	0xffff0080
++
++static gboolean hiby_sink_disabled(struct avdtp_local_sep *sep)
++{
++	int fd, cfg = 1, ret;
++
++	if (sep->info.type != AVDTP_SEP_TYPE_SINK)
++		return FALSE;
++
++	fd = open("/dev/sa-config", O_RDWR);
++	if (fd < 0)
++		return FALSE;
++
++	ret = ioctl(fd, SA_CONFIG_GET_BT_SOURCE_CFG, &cfg);
++	close(fd);
++
++	if (ret != 0)
++		return FALSE;
++
++	DBG("sa-config bt source cfg = %d", cfg);
++	return cfg == 0;
++}
++
+ static gboolean avdtp_getcap_cmd(struct avdtp *session, uint8_t transaction,
+ 					struct seid_req *req, unsigned int size,
+ 					gboolean get_all)
+@@ -1420,6 +1488,11 @@ static gboolean avdtp_getcap_cmd(struct avdtp *session, uint8_t transaction,
+ 		goto failed;
+ 	}
+ 
++	if (hiby_sink_disabled(sep)) {
++		err = AVDTP_BAD_STATE;
++		goto failed;
++	}
++
+ 	if (get_all && session->server->version < 0x0103)
+ 		return avdtp_unknown_cmd(session, transaction, cmd);
+ 
+@@ -1501,6 +1574,11 @@ static gboolean avdtp_setconf_cmd(struct avdtp *session, uint8_t transaction,
+ 		goto failed;
+ 	}
+ 
++	if (hiby_sink_disabled(sep)) {
++		err = AVDTP_BAD_STATE;
++		goto failed;
++	}
++
+ 	if (sep->stream) {
+ 		err = AVDTP_SEP_IN_USE;
+ 		goto failed;
+@@ -2929,6 +3007,44 @@ static gboolean avdtp_reconfigure_resp(struct avdtp *session,
+ 					struct avdtp_stream *stream,
+ 					struct avdtp_single_header *resp, int size)
+ {
++	struct avdtp_local_sep *sep = stream->lsep;
++	struct pending_req *req = session->req;
++	struct avdtp_service_capability *codec = NULL;
++	gboolean dr = FALSE;
++	GSList *new_caps, *l;
++
++	/* HiBy: vanilla ignored the response. Apply the new codec
++	 * configuration to the stream and confirm to the upper layer. */
++	if (req && req->data && req->data_size > 1) {
++		new_caps = caps_to_list((uint8_t *) req->data + 1,
++					req->data_size - 1, &codec, &dr);
++
++		for (l = new_caps; l != NULL; l = g_slist_next(l)) {
++			struct avdtp_service_capability *ncap = l->data;
++			GSList *o;
++
++			for (o = stream->caps; o != NULL; o = g_slist_next(o)) {
++				struct avdtp_service_capability *ocap = o->data;
++
++				if (ocap->category == ncap->category) {
++					stream->caps = g_slist_remove(
++							stream->caps, ocap);
++					g_free(ocap);
++					break;
++				}
++			}
++			stream->caps = g_slist_append(stream->caps, ncap);
++		}
++		g_slist_free(new_caps);
++
++		if (codec)
++			stream->codec = codec;
++	}
++
++	if (sep->cfm && sep->cfm->reconfigure)
++		sep->cfm->reconfigure(session, sep, stream, NULL,
++						sep->user_data);
++
+ 	return TRUE;
+ }
+ 
+@@ -3422,6 +3538,71 @@ static gboolean process_discover(gpointer data)
+ 	return FALSE;
+ }
+ 
++/*
++ * R3Pro car-Bluetooth fix (acceptor-initiated A2DP).
++ *
++ * When the remote endpoint (e.g. a car head unit) initiates A2DP and
++ * configures one of our local SEPs, we end up holding an active stream but we
++ * never ran an outgoing DISCOVER, so session->seps stays empty. A later
++ * play-time avdtp_discover() would then put a fresh AVDTP_DISCOVER on the air,
++ * which such remotes reject with BAD_STATE (their stream is already open) ->
++ * playback fails until a manual reconnect.
++ *
++ * Synthesize remote SEP entries from the streams we already have so that
++ * avdtp_discover() takes the cached path below and the existing open stream is
++ * reused. Each synthesized SEP owns a private copy of the configured caps so
++ * it survives stream teardown; stream_free() already clears rsep->stream for
++ * the matching rseid, leaving a valid "discovered but idle" SEP afterwards.
++ */
++static struct avdtp_service_capability *avdtp_copy_caps(GSList *src,
++							GSList **dst)
++{
++	struct avdtp_service_capability *codec = NULL;
++	GSList *l;
++
++	for (l = src; l != NULL; l = g_slist_next(l)) {
++		struct avdtp_service_capability *cap = l->data;
++		struct avdtp_service_capability *copy;
++
++		copy = g_malloc(sizeof(struct avdtp_service_capability) +
++								cap->length);
++		memcpy(copy, cap, sizeof(struct avdtp_service_capability) +
++								cap->length);
++		*dst = g_slist_append(*dst, copy);
++
++		if (copy->category == AVDTP_MEDIA_CODEC)
++			codec = copy;
++	}
++
++	return codec;
++}
++
++static void avdtp_seps_from_streams(struct avdtp *session)
++{
++	GSList *l;
++
++	for (l = session->streams; l != NULL; l = g_slist_next(l)) {
++		struct avdtp_stream *stream = l->data;
++		struct avdtp_remote_sep *rsep;
++
++		if (find_remote_sep(session->seps, stream->rseid))
++			continue;
++
++		rsep = g_new0(struct avdtp_remote_sep, 1);
++		rsep->seid = stream->rseid;
++		rsep->type = (stream->lsep->info.type == AVDTP_SEP_TYPE_SOURCE) ?
++				AVDTP_SEP_TYPE_SINK : AVDTP_SEP_TYPE_SOURCE;
++		rsep->media_type = stream->lsep->info.media_type;
++		rsep->codec = avdtp_copy_caps(stream->caps, &rsep->caps);
++		rsep->stream = stream;
++
++		session->seps = g_slist_append(session->seps, rsep);
++
++		DBG("synthesized remote SEP seid %d type %d from existing "
++				"stream (acceptor path)", rsep->seid, rsep->type);
++	}
++}
++
+ int avdtp_discover(struct avdtp *session, avdtp_discover_cb_t cb,
+ 			void *user_data)
+ {
+@@ -3430,6 +3611,9 @@ int avdtp_discover(struct avdtp *session, avdtp_discover_cb_t cb,
+ 	if (session->discov_cb)
+ 		return -EBUSY;
+ 
++	if (!session->seps && session->streams)
++		avdtp_seps_from_streams(session);
++
+ 	if (session->seps) {
+ 		session->discov_cb = cb;
+ 		session->user_data = user_data;
+@@ -3594,8 +3778,7 @@ int avdtp_set_configuration(struct avdtp *session,
+ int avdtp_reconfigure(struct avdtp *session, GSList *caps,
+ 			struct avdtp_stream *stream)
+ {
+-	struct reconf_req *req;
+-	unsigned char *ptr;
++	uint8_t *req, *ptr;
+ 	int caps_len, err;
+ 	GSList *l;
+ 	struct avdtp_service_capability *cap;
+@@ -3606,25 +3789,36 @@ int avdtp_reconfigure(struct avdtp *session, GSList *caps,
+ 	if (stream->lsep->state != AVDTP_STATE_OPEN)
+ 		return -EINVAL;
+ 
+-	/* Calculate total size of request */
++	/* HiBy/AVDTP spec fixes vs vanilla 4.101:
++	 *  - only application service capabilities (Media Codec, Content
++	 *    Protection) are allowed in RECONFIGURE;
++	 *  - wire format is [ACP SEID][capabilities...] (vanilla inserted two
++	 *    zero bytes from the reconf_req serv_cap fields). */
+ 	for (l = caps, caps_len = 0; l != NULL; l = g_slist_next(l)) {
+ 		cap = l->data;
++		if (cap->category != AVDTP_MEDIA_CODEC &&
++				cap->category != AVDTP_CONTENT_PROTECTION)
++			continue;
+ 		caps_len += cap->length + 2;
+ 	}
+ 
+-	req = g_malloc0(sizeof(struct reconf_req) + caps_len);
++	if (caps_len == 0)
++		return -EINVAL;
+ 
+-	req->acp_seid = stream->rseid;
++	req = g_malloc0(1 + caps_len);
++	req[0] = stream->rseid << 2;
+ 
+-	/* Copy the capabilities into the request */
+-	for (l = caps, ptr = req->caps; l != NULL; l = g_slist_next(l)) {
++	for (l = caps, ptr = req + 1; l != NULL; l = g_slist_next(l)) {
+ 		cap = l->data;
++		if (cap->category != AVDTP_MEDIA_CODEC &&
++				cap->category != AVDTP_CONTENT_PROTECTION)
++			continue;
+ 		memcpy(ptr, cap, cap->length + 2);
+ 		ptr += cap->length + 2;
+ 	}
+ 
+ 	err = send_request(session, FALSE, stream, AVDTP_RECONFIGURE, req,
+-						sizeof(*req) + caps_len);
++							1 + caps_len);
+ 	g_free(req);
+ 
+ 	return err;
+@@ -3647,6 +3841,22 @@ int avdtp_open(struct avdtp *session, struct avdtp_stream *stream)
+ 							&req, sizeof(req));
+ }
+ 
++static gboolean start_timeout(gpointer user_data)
++{
++	struct avdtp_stream *stream = user_data;
++	struct avdtp *session = stream->session;
++
++	stream->open_acp = FALSE;
++	stream->start_timer = 0;
++
++	DBG("remote did not START, starting stream ourselves");
++
++	if (avdtp_start(session, stream) < 0)
++		error("start_timeout: avdtp_start failed");
++
++	return FALSE;
++}
++
+ int avdtp_start(struct avdtp *session, struct avdtp_stream *stream)
+ {
+ 	struct start_req req;
+@@ -3663,7 +3873,16 @@ int avdtp_start(struct avdtp *session, struct avdtp_stream *stream)
+ 	 *  to start the streaming via GAVDP_START.
+ 	 */
+ 	if (stream->open_acp) {
+-		stream->starting = TRUE;
++		/* Backport of upstream BlueZ start_timer logic: give the remote
++		 * START_TIMEOUT to send AVDTP_START itself, then start the stream
++		 * ourselves. Car head units that configure+open the stream never
++		 * send START (they expect the source to), which left playback
++		 * hung waiting forever. */
++		if (stream->start_timer)
++			return 0;
++
++		stream->start_timer = g_timeout_add_seconds(START_TIMEOUT,
++							start_timeout, stream);
+ 		return 0;
+ 	}
+ 
+@@ -3790,6 +4009,8 @@ int avdtp_delay_report(struct avdtp *session, struct avdtp_stream *stream,
+ struct avdtp_local_sep *avdtp_register_sep(const bdaddr_t *src, uint8_t type,
+ 						uint8_t media_type,
+ 						uint8_t codec_type,
++						uint32_t vendor_id,
++						uint16_t codec_id,
+ 						gboolean delay_reporting,
+ 						struct avdtp_sep_ind *ind,
+ 						struct avdtp_sep_cfm *cfm,
+@@ -3812,6 +4033,8 @@ struct avdtp_local_sep *avdtp_register_sep(const bdaddr_t *src, uint8_t type,
+ 	sep->info.type = type;
+ 	sep->info.media_type = media_type;
+ 	sep->codec = codec_type;
++	sep->vendor_id = vendor_id;
++	sep->codec_id = codec_id;
+ 	sep->ind = ind;
+ 	sep->cfm = cfm;
+ 	sep->user_data = user_data;
+diff --git a/audio/avdtp.h b/audio/avdtp.h
+index dac093b..364f279 100644
+--- a/audio/avdtp.h
++++ b/audio/avdtp.h
+@@ -284,9 +284,14 @@ int avdtp_abort(struct avdtp *session, struct avdtp_stream *stream);
+ int avdtp_delay_report(struct avdtp *session, struct avdtp_stream *stream,
+ 							uint16_t delay);
+ 
++/* HiBy: implemented in a2dp.c */
++gboolean a2dp_codec_support(struct avdtp_media_codec_capability *codec);
++
+ struct avdtp_local_sep *avdtp_register_sep(const bdaddr_t *src, uint8_t type,
+ 						uint8_t media_type,
+ 						uint8_t codec_type,
++						uint32_t vendor_id,
++						uint16_t codec_id,
+ 						gboolean delay_reporting,
+ 						struct avdtp_sep_ind *ind,
+ 						struct avdtp_sep_cfm *cfm,

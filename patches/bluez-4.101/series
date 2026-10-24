@@ -1,0 +1,10 @@
+0001-avdtp-streams-started-by-the-remote-device-in-place-.patch
+0002-audio-device-avoid-the-sink-auto-connect-race-when-t.patch
+0003-avrcp-advertise-AVRCP-target-1.3-which-the-tested-ca.patch
+0004-a2dp-LDAC-aptX-UAT-UAT-TWS-and-AAC-endpoints-compati.patch
+0005-audio-unix-HiBy-ALSA-plugin-IPC.patch
+0006-adapter-HiBy-DiscoverType-property-classic-only-disc.patch
+0007-a2dp-register-the-SBC-source-endpoint-first.patch
+0008-a2dp-offer-LDAC-only-at-the-player-s-preferred-rate.patch
+0009-audio-unix-show-the-plugin-LDAC-at-the-player-s-pref.patch
+0010-a2dp-publish-the-remote-s-sink-codecs-for-the-player.patch

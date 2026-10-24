@@ -1,0 +1,455 @@
+#include "board_config.h"
+#include "dlna_control.h"
+#include "subprocess.h"
+#include "http_client.h"
+#include "debug_log.h"
+
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <dirent.h>
+
+/* Unix domain socket where dmrd expects its playback companion to listen. */
+#define DMR_STREAMER_SOCKET_PATH "/data/dmr_streamer"
+
+/* Temporary download directory and file path on the SD card. Uses a dot-prefixed
+ * directory so recursive library scans ignore it. */
+#ifdef HOST_BUILD
+#define DLNA_TEMP_DOWNLOAD_DIR "./music/.dlna_cast"
+#else
+#define DLNA_TEMP_DOWNLOAD_DIR BOARD_SD_ROOT "/.dlna_cast"
+#endif
+#define DLNA_TEMP_DOWNLOAD_PATH DLNA_TEMP_DOWNLOAD_DIR "/dlna_track.download"
+
+/* A cast track is downloaded whole before it plays: never more than
+ * DLNA_DOWNLOAD_MAX_BYTES, and always leaving DLNA_DOWNLOAD_FREE_MARGIN
+ * free on the card. */
+#define DLNA_DOWNLOAD_MAX_BYTES (1ULL << 30)
+#define DLNA_DOWNLOAD_FREE_MARGIN (64ULL << 20)
+#define DLNA_CONNECT_TIMEOUT_MS 10000
+#define DLNA_READ_TIMEOUT_MS 20000
+
+static pthread_mutex_t dlna_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static atomic_bool running = false;
+static int listen_fd = -1;
+static pthread_t listener_thread;
+static pthread_mutex_t listener_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int active_client_fd = -1;
+
+/* Accumulated from set_uri: and set_meta: commands before play@ triggers
+ * download. Guarded by dlna_mutex. */
+static char pending_uri[2048] = {0};
+static char pending_title[256] = {0};
+static char pending_artist[256] = {0};
+static char pending_album[256] = {0};
+
+static atomic_bool stop_requested = false;
+
+static uint64_t dlna_download_generation = 0;
+/* The download in progress, if any; guarded by dlna_mutex. Owned by its
+ * download thread, which clears this before freeing it. */
+static http_cancel_token_t * active_download_cancel = NULL;
+static bool track_ready = false;
+static char ready_path[512] = {0};
+static char ready_title[256] = {0};
+static char ready_artist[256] = {0};
+static char ready_album[256] = {0};
+static char last_produced_path[512] = {0}; /* Superseded on the next successful download, then removed */
+
+/* Guarded by dlna_mutex. Updated via dlna_control_notify_status(). */
+static bool status_playing = false;
+static bool status_paused = false;
+
+/* Optimistic playback state flag set upon receiving play@ to immediately report
+ * PLAYING to controller queries while the track downloads in the background.
+ * Cleared once real playback starts or stop is requested. */
+static bool cast_intent_playing = false;
+
+typedef struct {
+    uint64_t generation;
+    char uri[2048];
+    char title[256];
+    char artist[256];
+    char album[256];
+} dlna_download_request_t;
+
+/* Maps supported audio Content-Type MIME strings to file extensions recognized
+ * by decoder_open(). Returns NULL for unrecognized types. */
+static const char * extension_for_content_type(const char * content_type) {
+    if (strcasecmp(content_type, "audio/flac") == 0 || strcasecmp(content_type, "audio/x-flac") == 0) return ".flac";
+    if (strcasecmp(content_type, "audio/mpeg") == 0 || strcasecmp(content_type, "audio/mp3") == 0) return ".mp3";
+    if (strcasecmp(content_type, "audio/wav") == 0 || strcasecmp(content_type, "audio/x-wav") == 0 ||
+        strcasecmp(content_type, "audio/wave") == 0 || strcasecmp(content_type, "audio/vnd.wave") == 0) return ".wav";
+    if (strcasecmp(content_type, "audio/aiff") == 0 || strcasecmp(content_type, "audio/x-aiff") == 0) return ".aiff";
+    if (strcasecmp(content_type, "audio/aac") == 0 || strcasecmp(content_type, "audio/aacp") == 0) return ".aac";
+    if (strcasecmp(content_type, "audio/mp4") == 0 || strcasecmp(content_type, "audio/x-m4a") == 0 ||
+        strcasecmp(content_type, "audio/m4a") == 0) return ".m4a";
+    if (strcasecmp(content_type, "audio/x-ape") == 0 || strcasecmp(content_type, "audio/ape") == 0) return ".ape";
+    if (MT_HAS_FEATURE(CODEC_WMA) && strcasecmp(content_type, "audio/x-ms-wma") == 0) return ".wma";
+    if (MT_HAS_FEATURE(CODEC_OPUS) && strcasecmp(content_type, "audio/opus") == 0) return ".opus";
+    /* Generic Ogg-container MIME types map to .ogg for Vorbis decoding. */
+    if (strcasecmp(content_type, "audio/ogg") == 0 || strcasecmp(content_type, "application/ogg") == 0) return ".ogg";
+    return NULL;
+}
+
+/* Cancels the download in progress, if any. Caller holds dlna_mutex. */
+static void cancel_active_download_locked(void) {
+    if (active_download_cancel) http_cancel_token_cancel(active_download_cancel);
+}
+
+/* Removes partial downloads left by an earlier run (power loss, crash). */
+static void remove_stale_downloads(void) {
+    DIR * dir = opendir(DLNA_TEMP_DOWNLOAD_DIR);
+    if (!dir) return;
+    struct dirent * ent;
+    const char * suffix = ".download";
+    size_t suffix_len = strlen(suffix);
+    while ((ent = readdir(dir)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len <= suffix_len || strcmp(ent->d_name + len - suffix_len, suffix) != 0) continue;
+        char path[600];
+        /* Never remove a cut-off path: it names a different file. */
+        if ((size_t) snprintf(path, sizeof(path), DLNA_TEMP_DOWNLOAD_DIR "/%s", ent->d_name) >= sizeof(path)) continue;
+        remove(path);
+    }
+    closedir(dir);
+}
+
+/* The largest download the card can take now; 0 when it is nearly full. */
+static uint64_t download_size_cap(void) {
+    struct statvfs vfs;
+    if (statvfs(DLNA_TEMP_DOWNLOAD_DIR, &vfs) != 0) return DLNA_DOWNLOAD_MAX_BYTES;
+    uint64_t free_bytes = (uint64_t) vfs.f_bavail * (uint64_t) vfs.f_frsize;
+    if (free_bytes <= DLNA_DOWNLOAD_FREE_MARGIN) return 0;
+    uint64_t cap = free_bytes - DLNA_DOWNLOAD_FREE_MARGIN;
+    return cap < DLNA_DOWNLOAD_MAX_BYTES ? cap : DLNA_DOWNLOAD_MAX_BYTES;
+}
+
+static void * dlna_download_thread_func(void * arg) {
+    dlna_download_request_t * req = (dlna_download_request_t *) arg;
+
+    mkdir(DLNA_TEMP_DOWNLOAD_DIR, 0755); /* Ignore EEXIST */
+
+    char temp_path[600];
+    snprintf(temp_path, sizeof(temp_path), DLNA_TEMP_DOWNLOAD_DIR "/dlna_track.%llu.download",
+             (unsigned long long) req->generation);
+
+    http_cancel_token_t cancel;
+    http_cancel_token_init(&cancel);
+    pthread_mutex_lock(&dlna_mutex);
+    bool current = req->generation == dlna_download_generation;
+    if (current) {
+        /* A newer play or a stop between handle_play() and here cancels
+         * through this token. */
+        active_download_cancel = &cancel;
+    }
+    pthread_mutex_unlock(&dlna_mutex);
+
+    uint64_t cap = download_size_cap();
+    char content_type[128];
+    bool ok = current && cap > 0 &&
+              http_get_to_file_cancelable_ex(req->uri, true, temp_path, (size_t) cap, DLNA_CONNECT_TIMEOUT_MS,
+                                             DLNA_READ_TIMEOUT_MS, &cancel, content_type, sizeof(content_type));
+
+    pthread_mutex_lock(&dlna_mutex);
+    if (active_download_cancel == &cancel) active_download_cancel = NULL;
+    pthread_mutex_unlock(&dlna_mutex);
+    http_cancel_token_destroy(&cancel);
+
+    if (!ok) {
+        DBG_LOG("dlna_control: download failed for '%s'\n", req->uri);
+        remove(temp_path);
+        free(req);
+        return NULL;
+    }
+
+    const char * ext = extension_for_content_type(content_type);
+    if (!ext) {
+        DBG_LOG("dlna_control: unrecognized/non-audio Content-Type '%s', not playing\n", content_type);
+        remove(temp_path);
+        free(req);
+        return NULL;
+    }
+
+    /* Target path with extension corresponding to the detected Content-Type. */
+    char final_path[512];
+    snprintf(final_path, sizeof(final_path), DLNA_TEMP_DOWNLOAD_DIR "/dlna_track.%llu%s",
+             (unsigned long long) req->generation, ext);
+    if (rename(temp_path, final_path) != 0) {
+        DBG_LOG("dlna_control: rename to '%s' failed\n", final_path);
+        remove(temp_path);
+        free(req);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&dlna_mutex);
+    if (req->generation != dlna_download_generation) {
+        /* a newer play request has since arrived, or stop() was called -- discard this stale completion */
+        pthread_mutex_unlock(&dlna_mutex);
+        remove(final_path);
+        free(req);
+        return NULL;
+    }
+    if (last_produced_path[0] != '\0' && strcmp(last_produced_path, final_path) != 0) {
+        remove(last_produced_path);
+    }
+    snprintf(last_produced_path, sizeof(last_produced_path), "%s", final_path);
+    snprintf(ready_path, sizeof(ready_path), "%s", final_path);
+    snprintf(ready_title, sizeof(ready_title), "%s", req->title);
+    snprintf(ready_artist, sizeof(ready_artist), "%s", req->artist);
+    snprintf(ready_album, sizeof(ready_album), "%s", req->album);
+    track_ready = true; /* Written last after path and metadata are updated */
+    pthread_mutex_unlock(&dlna_mutex);
+
+    free(req);
+    return NULL;
+}
+
+static void handle_play(void) {
+    dlna_download_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
+    pthread_mutex_lock(&dlna_mutex);
+    snprintf(req->uri, sizeof(req->uri), "%s", pending_uri);
+    snprintf(req->title, sizeof(req->title), "%s", pending_title);
+    snprintf(req->artist, sizeof(req->artist), "%s", pending_artist);
+    snprintf(req->album, sizeof(req->album), "%s", pending_album);
+    pthread_mutex_unlock(&dlna_mutex);
+
+    if (req->uri[0] == '\0') {
+        free(req);
+        return;
+    }
+
+    pthread_mutex_lock(&dlna_mutex);
+    cast_intent_playing = true;
+    req->generation = ++dlna_download_generation;
+    cancel_active_download_locked(); /* superseded by this one */
+    pthread_mutex_unlock(&dlna_mutex);
+
+    /* Run download in a detached thread to prevent blocking socket polling. */
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &attr, dlna_download_thread_func, req) != 0) {
+        free(req);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+static void handle_connection(int cfd) {
+    unsigned char buf[4096];
+    ssize_t n = read(cfd, buf, sizeof(buf) - 1);
+    if (n <= 0) return; /* listener owns close/active-client cleanup */
+    buf[n] = '\0';
+    DBG_LOG("dlna_control: recv '%.100s'\n", (const char *) buf);
+
+    if ((size_t) n >= 10 && memcmp(buf, "get_volume", 10) == 0) {
+        /* Reply to get_volume with nominal full volume. */
+        const char * reply = "100";
+        write(cfd, reply, strlen(reply));
+    } else if ((size_t) n >= 8 && memcmp(buf, "get_mute", 8) == 0) {
+        const char * reply = "0";
+        write(cfd, reply, strlen(reply));
+    } else if ((size_t) n >= 6 && memcmp(buf, "state@", 6) == 0) {
+        /* Report transport state (PLAYING, PAUSED_PLAYBACK, or STOPPED). */
+        pthread_mutex_lock(&dlna_mutex);
+        const char * reply = (status_playing || cast_intent_playing) ? "PLAYING"
+                              : status_paused                         ? "PAUSED_PLAYBACK"
+                                                                       : "STOPPED";
+        pthread_mutex_unlock(&dlna_mutex);
+        DBG_LOG("dlna_control: replying to state@ with '%s'\n", reply);
+        write(cfd, reply, strlen(reply));
+    } else if ((size_t) n > 8 && memcmp(buf, "set_uri:", 8) == 0) {
+        pthread_mutex_lock(&dlna_mutex);
+        /* A cut-off URI is a different address: keep the previous one. */
+        const char * uri = (const char *) buf + 8;
+        size_t uri_len = strlen(uri);
+        if (uri_len < sizeof(pending_uri)) memcpy(pending_uri, uri, uri_len + 1);
+        pthread_mutex_unlock(&dlna_mutex);
+    } else if ((size_t) n > 16 && memcmp(buf, "set_meta:title:", 15) == 0) {
+        pthread_mutex_lock(&dlna_mutex);
+        snprintf(pending_title, sizeof(pending_title), "%.*s", (int) sizeof(pending_title) - 1, buf + 15); /* display text */
+        pthread_mutex_unlock(&dlna_mutex);
+    } else if ((size_t) n > 17 && memcmp(buf, "set_meta:artist:", 16) == 0) {
+        pthread_mutex_lock(&dlna_mutex);
+        snprintf(pending_artist, sizeof(pending_artist), "%.*s", (int) sizeof(pending_artist) - 1, buf + 16); /* display text */
+        pthread_mutex_unlock(&dlna_mutex);
+    } else if ((size_t) n > 16 && memcmp(buf, "set_meta:album:", 15) == 0) {
+        pthread_mutex_lock(&dlna_mutex);
+        snprintf(pending_album, sizeof(pending_album), "%.*s", (int) sizeof(pending_album) - 1, buf + 15); /* display text */
+        pthread_mutex_unlock(&dlna_mutex);
+    } else if ((size_t) n >= 5 && memcmp(buf, "play@", 5) == 0) {
+        handle_play();
+    } else if ((size_t) n >= 4 && memcmp(buf, "stop", 4) == 0) {
+        pthread_mutex_lock(&dlna_mutex);
+        cast_intent_playing = false;
+        pthread_mutex_unlock(&dlna_mutex);
+        atomic_store_explicit(&stop_requested, true, memory_order_release); /* Consumed by LVGL/main thread */
+    }
+    /* Other commands are ignored without reply. */
+
+}
+
+/* Timeout for accept polling so listener_thread_func periodically checks the
+ * running flag and terminates cleanly on stop. */
+#define ACCEPT_POLL_TIMEOUT_MS 200
+
+static void * listener_thread_func(void * arg) {
+    (void) arg;
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_lock(&listener_mutex);
+        int fd = listen_fd;
+        pthread_mutex_unlock(&listener_mutex);
+        if (fd < 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, ACCEPT_POLL_TIMEOUT_MS);
+        if (pr <= 0) continue; /* Timeout or interrupted -- re-check running */
+        if (!atomic_load_explicit(&running, memory_order_acquire)) break;
+
+        int cfd = accept(fd, NULL, NULL);
+        if (cfd < 0) continue;
+        struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        pthread_mutex_lock(&listener_mutex);
+        if (!atomic_load_explicit(&running, memory_order_acquire)) {
+            pthread_mutex_unlock(&listener_mutex);
+            close(cfd);
+            break;
+        }
+        active_client_fd = cfd;
+        pthread_mutex_unlock(&listener_mutex);
+        handle_connection(cfd);
+        pthread_mutex_lock(&listener_mutex);
+        if (active_client_fd == cfd) {
+            active_client_fd = -1;
+            close(cfd);
+        }
+        pthread_mutex_unlock(&listener_mutex);
+    }
+    return NULL;
+}
+
+void dlna_control_start(void) {
+    pthread_mutex_lock(&listener_mutex);
+    if (atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
+
+    char * dmrd_argv[] = { (char *) "/usr/bin/dmrd", NULL };
+    subprocess_spawn_daemon(dmrd_argv);
+
+    unlink(DMR_STREAMER_SOCKET_PATH);
+    remove_stale_downloads();
+
+    listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", DMR_STREAMER_SOCKET_PATH);
+
+    if (bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        close(listen_fd);
+        listen_fd = -1;
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
+    chmod(DMR_STREAMER_SOCKET_PATH, 0777); /* Allow dmrd process to connect */
+
+    if (listen(listen_fd, 4) < 0) {
+        close(listen_fd);
+        listen_fd = -1;
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
+
+    atomic_store_explicit(&running, true, memory_order_release);
+    atomic_store_explicit(&stop_requested, false, memory_order_release);
+    if (pthread_create(&listener_thread, NULL, listener_thread_func, NULL) != 0) {
+        atomic_store_explicit(&running, false, memory_order_release);
+        close(listen_fd);
+        listen_fd = -1;
+    }
+    pthread_mutex_unlock(&listener_mutex);
+}
+
+void dlna_control_stop(void) {
+    pthread_mutex_lock(&listener_mutex);
+    if (!atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
+
+    pthread_mutex_lock(&dlna_mutex);
+    ++dlna_download_generation;
+    cancel_active_download_locked();
+    pthread_mutex_unlock(&dlna_mutex);
+
+    atomic_store_explicit(&running, false, memory_order_release);
+    int stopped_listen_fd = listen_fd;
+    if (stopped_listen_fd >= 0) shutdown(stopped_listen_fd, SHUT_RDWR);
+    if (active_client_fd >= 0) shutdown(active_client_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&listener_mutex);
+
+    pthread_join(listener_thread, NULL);
+    pthread_mutex_lock(&listener_mutex);
+    if (listen_fd == stopped_listen_fd && listen_fd >= 0) {
+        close(listen_fd);
+        listen_fd = -1;
+    }
+    pthread_mutex_unlock(&listener_mutex);
+    unlink(DMR_STREAMER_SOCKET_PATH);
+
+    char * argv[] = { (char *) "killall", (char *) "dmrd", NULL };
+    subprocess_run(argv, NULL, 0);
+}
+
+bool dlna_control_consume_ready_track(char * out_path, size_t path_size,
+                                       char * out_title, size_t title_size,
+                                       char * out_artist, size_t artist_size,
+                                       char * out_album, size_t album_size) {
+    pthread_mutex_lock(&dlna_mutex);
+    bool result = track_ready;
+    if (result) {
+        track_ready = false;
+        snprintf(out_path, path_size, "%s", ready_path);
+        snprintf(out_title, title_size, "%s", ready_title);
+        snprintf(out_artist, artist_size, "%s", ready_artist);
+        snprintf(out_album, album_size, "%s", ready_album);
+    }
+    pthread_mutex_unlock(&dlna_mutex);
+    return result;
+}
+
+bool dlna_control_consume_stop_requested(void) {
+    return atomic_exchange_explicit(&stop_requested, false, memory_order_acq_rel);
+}
+
+void dlna_control_notify_status(bool playing, bool paused) {
+    pthread_mutex_lock(&dlna_mutex);
+    status_playing = playing;
+    status_paused = paused;
+    if (playing) {
+        /* Real playback started; clear optimistic intent flag. */
+        cast_intent_playing = false;
+    }
+    pthread_mutex_unlock(&dlna_mutex);
+}

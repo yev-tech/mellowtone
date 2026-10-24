@@ -1,0 +1,185 @@
+--- a/src/drivers/display/fb/lv_linux_fbdev.c
++++ b/src/drivers/display/fb/lv_linux_fbdev.c
+@@ -90,6 +90,13 @@
+      * presentation, in case anything ever queues a real LVGL flush during
+      * that window despite invalidation being disabled. */
+     bool external_composition_active;
++
++#if defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME
++    /* Smart-LCD controller put to sleep (lv_linux_fbdev_set_panel_sleep()):
++     * flushes still update the pages in memory but never start a transfer,
++     * which would wake the controller again. */
++    bool panel_asleep;
++#endif
+ } lv_linux_fb_t;
+ 
+ /**********************
+@@ -165,7 +172,13 @@
+     LV_LOG_INFO("The framebuffer device was opened successfully");
+ 
+     /* Make sure that the display is on.*/
++#if defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME
++    /* Not on jzfb smart LCDs: unblank reprograms the DMA registers even
++     * while a transfer is running, misaligning the panel until reboot. */
++    if(0) {
++#else
+     if(ioctl(dsc->fbfd, FBIOBLANK, FB_BLANK_UNBLANK) != 0) {
++#endif
+         perror("ioctl(FBIOBLANK)");
+         /* Don't return. Some framebuffer drivers like efifb or simplefb don't implement FBIOBLANK.*/
+     }
+@@ -429,6 +442,28 @@
+     return true;
+ }
+ 
++#if defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME && !LV_LINUX_FBDEV_BSD
++bool lv_linux_fbdev_set_panel_sleep(lv_display_t * disp, bool sleep)
++{
++    if(!disp) return false;
++    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
++    if(!dsc || dsc->fbfd < 0) return false;
++    if(dsc->panel_asleep == sleep) return true;
++
++    /* jzfb vendor ioctl 0x80044620 with 1 stops the SLCD controller
++     * (no vsync, no transfers), 0 starts it again. The stock UI wakes with
++     * 0 and then pans once to restart the transfers. */
++    int arg = sleep ? 1 : 0;
++    if(ioctl(dsc->fbfd, 0x80044620, &arg) != 0) {
++        perror("ioctl(jzfb sleep)");
++        if(sleep) return false;
++    }
++    dsc->panel_asleep = sleep;
++    if(!sleep && ioctl(dsc->fbfd, FBIOPAN_DISPLAY, &dsc->vinfo) == -1) perror("Error panning display");
++    return true;
++}
++#endif
++
+ /**********************
+  *   STATIC FUNCTIONS
+  **********************/
+@@ -598,6 +633,57 @@
+     lv_area_t rotated_area;
+     const lv_display_rotation_t rotation = lv_display_get_rotation(disp);
+ 
++#if LV_LINUX_FBDEV_MMAP && defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME
++    /* 180-degree panels (R3 Pro): rotate only the dirty area, straight from
++     * the direct-mode render buffer into both driver pages, instead of
++     * rotating and copying the whole 360x480x4 screen three times per frame
++     * (rotate into a temp buffer, copy, copy the mirror). A clock tick or a
++     * progress bar now costs a few KB instead of ~2 MB; scrolling about a
++     * third of what it did. The SLCD transfer (pan) stays on the last flush. */
++    if(rotation == LV_DISPLAY_ROTATION_180 && LV_LINUX_FBDEV_RENDER_MODE == LV_DISPLAY_RENDER_MODE_DIRECT &&
++       px_size == 4 && !dsc->pan_double_buffer) {
++        lv_draw_buf_t * draw_buf = lv_display_get_buf_active(disp);
++        const int32_t hor = lv_display_get_horizontal_resolution(disp);
++        const int32_t ver = lv_display_get_vertical_resolution(disp);
++        lv_area_t a;
++        lv_area_t screen;
++        lv_area_set(&screen, 0, 0, hor - 1, ver - 1);
++        if(draw_buf && lv_area_intersect(&a, area, &screen) &&
++           (uint32_t)hor <= dsc->vinfo.xres && (uint32_t)ver <= dsc->vinfo.yres) {
++            const uint32_t src_stride = draw_buf->header.stride;
++            const uint32_t frame_bytes = (uint32_t)dsc->finfo.line_length * dsc->vinfo.yres;
++            const uint32_t mirror_off = (uint32_t)(dsc->screensize / 2);
++            const bool mirror = mirror_off >= frame_bytes;
++            const int32_t w = lv_area_get_width(&a);
++            uint8_t * fbp = (uint8_t *)dsc->fbp;
++            for(int32_t y = a.y1; y <= a.y2; y++) {
++                const uint32_t * src = (const uint32_t *)(draw_buf->data + (uint32_t)y * src_stride) + a.x1;
++                const uint32_t dy = (uint32_t)(ver - 1 - y) + dsc->vinfo.yoffset;
++                const uint32_t dx = (uint32_t)(hor - 1 - a.x2) + dsc->vinfo.xoffset;
++                uint32_t * d0 = (uint32_t *)(fbp + dy * dsc->finfo.line_length + dx * 4);
++                uint32_t * d1 = (uint32_t *)((uint8_t *)d0 + mirror_off);
++                if(mirror) {
++                    for(int32_t i = 0; i < w; i++) {
++                        uint32_t px = src[w - 1 - i];
++                        d0[i] = px;
++                        d1[i] = px;
++                    }
++                }
++                else {
++                    for(int32_t i = 0; i < w; i++) d0[i] = src[w - 1 - i];
++                }
++            }
++        }
++        if(lv_display_flush_is_last(disp) && !dsc->panel_asleep) {
++            int frame_done = 0;
++            (void)ioctl(dsc->fbfd, 0x80044620, &frame_done);
++            if(ioctl(dsc->fbfd, FBIOPAN_DISPLAY, &dsc->vinfo) == -1) perror("Error panning display");
++        }
++        lv_display_flush_ready(disp);
++        return;
++    }
++#endif
++
+     /* Not all framebuffer kernel drivers support hardware rotation, so we need to handle it in software here */
+     if(rotation != LV_DISPLAY_ROTATION_0) {
+         int32_t src_w;
+@@ -680,13 +766,47 @@
+ 
+         color_p += y_offset * stride + x_offset * px_size;
+ 
++#if defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME && LV_LINUX_FBDEV_MMAP
++        /* jzfb allocates two pages and its pan handler alternates between
++         * them on its own (the stock UI double-buffers that way), so the page
++         * being scanned out is not under our control. Keep both identical. */
++        /* The driver's pages are page-aligned: on the R3 Pro the second one
++         * starts at smem_len / 2 (0xa9000), not at line_length * yres
++         * (0xa8c00). Writing the mirror 1 KiB early shows up as a picture
++         * shifted sideways whenever the driver is scanning out page 1. */
++        const uint32_t frame_bytes = (uint32_t)dsc->finfo.line_length * dsc->vinfo.yres;
++        const uint32_t mirror_off = (uint32_t)(dsc->screensize / 2);
++        const bool mirror = !dsc->pan_double_buffer && mirror_off >= frame_bytes;
++#endif
+         for(int32_t y = clipped_area.y1; y <= clipped_area.y2; y++) {
+             write_to_fb(dsc, fb_pos, color_p, w * px_size);
++#if defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME && LV_LINUX_FBDEV_MMAP
++            if(mirror) write_to_fb(dsc, fb_pos + mirror_off, color_p, w * px_size);
++#endif
+             fb_pos += dsc->finfo.line_length;
+             color_p += stride;
+         }
+     }
+ 
++#if defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME && !LV_LINUX_FBDEV_BSD
++    /* Smart-LCD controllers (Ingenic jzfb SLCD) keep the image in panel GRAM
++     * and only transfer a new frame when the driver is asked to pan. With a
++     * single-height virtual screen there is no page flip, so request the
++     * transfer explicitly once the frame is complete (both pages hold it,
++     * see the mirrored write above). */
++    if(!dsc->pan_double_buffer && !dsc->panel_asleep && lv_display_flush_is_last(disp)) {
++        /* Like the stock UI: wait until the previous SLCD transfer has
++         * finished before starting the next one. Starting a transfer while
++         * one is in flight desyncs the panel's GRAM write pointer and the
++         * picture shows up shifted. (jzfb vendor ioctl, _IOR('F', 0x20, int).) */
++        int frame_done = 0;
++        (void)ioctl(dsc->fbfd, 0x80044620, &frame_done);
++        if(ioctl(dsc->fbfd, FBIOPAN_DISPLAY, &dsc->vinfo) == -1) {
++            perror("Error panning display");
++        }
++    }
++#endif
++
+     if(dsc->force_refresh) {
+         dsc->vinfo.activate |= FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+         if(ioctl(dsc->fbfd, FBIOPUT_VSCREENINFO, &(dsc->vinfo)) == -1) {
+--- a/src/drivers/display/fb/lv_linux_fbdev.h
++++ b/src/drivers/display/fb/lv_linux_fbdev.h
+@@ -110,6 +110,17 @@
+  */
+ bool lv_linux_fbdev_end_external_composition(lv_display_t * disp);
+ 
++#if defined(LV_LINUX_FBDEV_PAN_EACH_FRAME) && LV_LINUX_FBDEV_PAN_EACH_FRAME
++/**
++ * Puts a jzfb smart-LCD controller to sleep (true) or wakes it (false, then
++ * pans once so transfers restart). While asleep, flushes never start a
++ * transfer. The caller stops rendering first and repaints after waking.
++ * Repeated calls with the same state do nothing. Returns false if the
++ * controller could not be put to sleep.
++ */
++bool lv_linux_fbdev_set_panel_sleep(lv_display_t * disp, bool sleep);
++#endif
++
+ /**********************
+  *      MACROS
+  **********************/

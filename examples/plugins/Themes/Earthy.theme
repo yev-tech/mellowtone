@@ -1,0 +1,25 @@
+# Example theme for Theme.lua (the file format is described at the top of
+# Theme.lua). Clay, moss and bark colors, with rounded, tinted rows in the
+# Music, Stream Media and Wireless menus. Copy it to
+# <SD card>/.mellowtone/plugins/Themes/.
+name=Earthy
+screen=0x140F0A
+card=0x241A10
+list_row=0x2E2216
+text_primary=0xF0E3D0
+text_muted=0x9A8060
+
+menu.music.bg_color=0x8A5A3C
+menu.music.text_color=0xF5EAD9
+menu.music.radius=16
+menu.music.row_gap=8
+
+menu.stream_media.bg_color=0x6B7C4F
+menu.stream_media.text_color=0xF5EAD9
+menu.stream_media.radius=16
+menu.stream_media.row_gap=8
+
+menu.wireless.bg_color=0xA87851
+menu.wireless.text_color=0x3A2A1E
+menu.wireless.radius=16
+menu.wireless.row_gap=8

@@ -1,0 +1,908 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mt <mt@localhost>
+Date: Mon, 5 Oct 2026 22:05:53 +0000
+Subject: [PATCH] a2dp: LDAC, aptX, UAT, UAT-TWS and AAC endpoints, compatible
+ with HiBy's bluetoothd
+
+Re-implements the codec layer of the stock HiBy R3 Pro bluetoothd (BlueZ 4.101 + vendor
+endpoints) from the protocol: extended endpoint registration with vendor and codec ids,
+capability and configuration handlers per codec, in-place reconfigure routing for a codec
+change, START handling without the 5 s automatic suspend, and the link MTU in the
+configuration response.
+---
+ audio/a2dp.c        | 592 +++++++++++++++++++++++++++++++++++++++++++-
+ audio/a2dp.h        |  13 +
+ audio/hiby-codecs.h |  27 ++
+ audio/ipc.h         |  34 +++
+ 4 files changed, 656 insertions(+), 10 deletions(-)
+ create mode 100644 audio/hiby-codecs.h
+
+diff --git a/audio/a2dp.c b/audio/a2dp.c
+index 404be53..6339530 100644
+--- a/audio/a2dp.c
++++ b/audio/a2dp.c
+@@ -28,6 +28,7 @@
+ #endif
+ 
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <errno.h>
+ 
+ #include <dbus/dbus.h>
+@@ -45,6 +46,7 @@
+ #include "source.h"
+ #include "unix.h"
+ #include "a2dp.h"
++#include "hiby-codecs.h"
+ #include "sdpd.h"
+ 
+ /* The duration that streams without users are allowed to stay in
+@@ -65,6 +67,8 @@ struct a2dp_sep {
+ 	struct a2dp_endpoint *endpoint;
+ 	uint8_t type;
+ 	uint8_t codec;
++	uint32_t vendor_id;	/* HiBy: vendor codecs (codec == 0xFF) */
++	uint16_t codec_id;
+ 	struct avdtp_local_sep *lsep;
+ 	struct avdtp *session;
+ 	struct avdtp_stream *stream;
+@@ -98,6 +102,7 @@ struct a2dp_setup {
+ 	avdtp_set_configuration_cb setconf_cb;
+ 	GSList *caps;
+ 	gboolean reconfigure;
++	gboolean inplace_reconf;	/* HiBy: AVDTP RECONFIGURE in flight */
+ 	gboolean start;
+ 	GSList *cb;
+ 	int ref;
+@@ -954,12 +959,9 @@ static gboolean start_ind(struct avdtp *session, struct avdtp_local_sep *sep,
+ 	else
+ 		DBG("Source %p: Start_Ind", sep);
+ 
+-	if (!a2dp_sep->locked) {
+-		a2dp_sep->session = avdtp_ref(session);
+-		a2dp_sep->suspend_timer = g_timeout_add_seconds(SUSPEND_TIMEOUT,
+-						(GSourceFunc) suspend_timeout,
+-						a2dp_sep);
+-	}
++	/* HiBy: no auto-suspend of remote-started streams (vanilla armed a
++	 * SUSPEND_TIMEOUT timer here); notify player clients instead. */
++	unix_start_ind(a2dp_get_dev(session));
+ 
+ 	if (!a2dp_sep->starting)
+ 		return TRUE;
+@@ -1020,6 +1022,9 @@ static gboolean suspend_ind(struct avdtp *session, struct avdtp_local_sep *sep,
+ 		a2dp_sep->session = NULL;
+ 	}
+ 
++	/* HiBy: notify player clients of remote suspend */
++	unix_suspend_ind(a2dp_get_dev(session));
++
+ 	if (!a2dp_sep->suspending)
+ 		return TRUE;
+ 
+@@ -1289,6 +1294,19 @@ static void reconf_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
+ 	if (!setup)
+ 		return;
+ 
++	if (err && setup->inplace_reconf && setup->stream) {
++		/* Remote rejected in-place reconfigure: fall back to the
++		 * close + set_configuration path (vanilla behaviour). */
++		DBG("in-place reconfigure rejected, falling back to close/reopen");
++		setup->inplace_reconf = FALSE;
++		setup->reconfigure = TRUE;
++		if (avdtp_close(session, setup->stream, FALSE) >= 0)
++			return;
++		setup->reconfigure = FALSE;
++	}
++
++	setup->inplace_reconf = FALSE;
++
+ 	if (err) {
+ 		setup->stream = NULL;
+ 		setup->err = err;
+@@ -1321,6 +1339,116 @@ static struct avdtp_sep_cfm cfm = {
+ 	.delay_report		= delay_report_cfm,
+ };
+ 
++/*
++ * HiBy codec layer (AAC, aptX, LDAC, UAT, UAT-TWS).
++ * Capability bytes are byte-identical to HiBy's stock fw 2.2 bluetoothd so the
++ * stock ALSA plugin / remote negotiation behave the same.
++ */
++int a2dp_aptx_support = 0;
++int a2dp_ldac_support = 0;
++int a2dp_uat_support = 0;
++int a2dp_uat_tws_support = 0;
++int a2dp_aac_support = 0;
++
++static const uint8_t aac_codec_info[] =
++	{ 0x00, A2DP_CODEC_MPEG24, 0xc0, 0xff, 0xfc, 0x84, 0xe2, 0x00 };
++static const uint8_t aptx_codec_info[] =
++	{ 0x00, A2DP_CODEC_VENDOR, 0x4f, 0x00, 0x00, 0x00, 0x01, 0x00, 0xf3 };
++static const uint8_t ldac_codec_info[] =
++	{ 0x00, A2DP_CODEC_VENDOR, 0x2d, 0x01, 0x00, 0x00, 0xaa, 0x00,
++								0x3c, 0x07 };
++static const uint8_t uat_codec_info[] =
++	{ 0x00, A2DP_CODEC_VENDOR, 0xcc, 0x06, 0x00, 0x00, 0x01, 0x00,
++								0x3f, 0x07 };
++static const uint8_t uat_tws_codec_info[] =
++	{ 0x00, A2DP_CODEC_VENDOR, 0xcc, 0x06, 0x00, 0x00, 0x02, 0x00,
++								0x0f, 0x07 };
++
++static gboolean hiby_getcap(struct a2dp_sep *a2dp_sep,
++				struct avdtp_local_sep *sep, gboolean get_all,
++				GSList **caps, const uint8_t *info, size_t len,
++				const char *name)
++{
++	struct avdtp_service_capability *cap;
++
++	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
++		DBG("%s Sink %p: Get_Capability_Ind", name, sep);
++	else
++		DBG("%s Source %p: Get_Capability_Ind", name, sep);
++
++	*caps = NULL;
++
++	cap = avdtp_service_cap_new(AVDTP_MEDIA_TRANSPORT, NULL, 0);
++	*caps = g_slist_append(*caps, cap);
++
++	cap = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, (void *) info, len);
++	*caps = g_slist_append(*caps, cap);
++
++	if (get_all) {
++		cap = avdtp_service_cap_new(AVDTP_DELAY_REPORTING, NULL, 0);
++		*caps = g_slist_append(*caps, cap);
++	}
++
++	return TRUE;
++}
++
++#define HIBY_GETCAP(fn, info, name)					\
++static gboolean fn(struct avdtp *session, struct avdtp_local_sep *sep,	\
++			gboolean get_all, GSList **caps, uint8_t *err,	\
++			void *user_data)					\
++{									\
++	return hiby_getcap(user_data, sep, get_all, caps, info,		\
++						sizeof(info), name);	\
++}
++
++HIBY_GETCAP(aac_getcap_ind, aac_codec_info, "AAC")
++HIBY_GETCAP(aptx_getcap_ind, aptx_codec_info, "APTX")
++HIBY_GETCAP(ldac_getcap_ind, ldac_codec_info, "LDAC")
++HIBY_GETCAP(uat_getcap_ind, uat_codec_info, "UAT")
++HIBY_GETCAP(uat_tws_getcap_ind, uat_tws_codec_info, "UAT TWS")
++
++/* Set_Configuration_Ind for AAC/vendor codecs: as sbc_setconf_ind but
++ * without SBC bitpool validation. */
++static gboolean hiby_setconf_ind(struct avdtp *session,
++					struct avdtp_local_sep *sep,
++					struct avdtp_stream *stream,
++					GSList *caps,
++					avdtp_set_configuration_cb cb,
++					void *user_data)
++{
++	struct a2dp_sep *a2dp_sep = user_data;
++	struct a2dp_setup *setup;
++
++	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
++		DBG("Sink %p: Set_Configuration_Ind", sep);
++	else
++		DBG("Source %p: Set_Configuration_Ind", sep);
++
++	setup = a2dp_setup_get(session);
++	if (!setup)
++		return FALSE;
++
++	a2dp_sep->stream = stream;
++	setup->sep = a2dp_sep;
++	setup->stream = stream;
++	setup->setconf_cb = cb;
++
++	for (; caps != NULL; caps = g_slist_next(caps)) {
++		struct avdtp_service_capability *cap = caps->data;
++
++		if (cap->category == AVDTP_DELAY_REPORTING &&
++					!a2dp_sep->delay_reporting) {
++			setup->err = g_new(struct avdtp_error, 1);
++			avdtp_error_init(setup->err, AVDTP_DELAY_REPORTING,
++					AVDTP_UNSUPPORTED_CONFIGURATION);
++			break;
++		}
++	}
++
++	g_idle_add(auto_config, setup);
++	return TRUE;
++}
++
+ static struct avdtp_sep_ind sbc_ind = {
+ 	.get_capability		= sbc_getcap_ind,
+ 	.set_configuration	= sbc_setconf_ind,
+@@ -1360,6 +1488,71 @@ static struct avdtp_sep_ind endpoint_ind = {
+ 	.delayreport		= endpoint_delayreport_ind,
+ };
+ 
++static struct avdtp_sep_ind aac_ind = {
++	.get_capability		= aac_getcap_ind,
++	.set_configuration	= hiby_setconf_ind,
++	.get_configuration	= getconf_ind,
++	.open			= open_ind,
++	.start			= start_ind,
++	.suspend		= suspend_ind,
++	.close			= close_ind,
++	.abort			= abort_ind,
++	.reconfigure		= reconf_ind,
++	.delayreport		= delayreport_ind,
++};
++
++static struct avdtp_sep_ind aptx_ind = {
++	.get_capability		= aptx_getcap_ind,
++	.set_configuration	= hiby_setconf_ind,
++	.get_configuration	= getconf_ind,
++	.open			= open_ind,
++	.start			= start_ind,
++	.suspend		= suspend_ind,
++	.close			= close_ind,
++	.abort			= abort_ind,
++	.reconfigure		= reconf_ind,
++	.delayreport		= delayreport_ind,
++};
++
++static struct avdtp_sep_ind ldac_ind = {
++	.get_capability		= ldac_getcap_ind,
++	.set_configuration	= hiby_setconf_ind,
++	.get_configuration	= getconf_ind,
++	.open			= open_ind,
++	.start			= start_ind,
++	.suspend		= suspend_ind,
++	.close			= close_ind,
++	.abort			= abort_ind,
++	.reconfigure		= reconf_ind,
++	.delayreport		= delayreport_ind,
++};
++
++static struct avdtp_sep_ind uat_ind = {
++	.get_capability		= uat_getcap_ind,
++	.set_configuration	= hiby_setconf_ind,
++	.get_configuration	= getconf_ind,
++	.open			= open_ind,
++	.start			= start_ind,
++	.suspend		= suspend_ind,
++	.close			= close_ind,
++	.abort			= abort_ind,
++	.reconfigure		= reconf_ind,
++	.delayreport		= delayreport_ind,
++};
++
++static struct avdtp_sep_ind uat_tws_ind = {
++	.get_capability		= uat_tws_getcap_ind,
++	.set_configuration	= hiby_setconf_ind,
++	.get_configuration	= getconf_ind,
++	.open			= open_ind,
++	.start			= start_ind,
++	.suspend		= suspend_ind,
++	.close			= close_ind,
++	.abort			= abort_ind,
++	.reconfigure		= reconf_ind,
++	.delayreport		= delayreport_ind,
++};
++
+ static sdp_record_t *a2dp_record(uint8_t type, uint16_t avdtp_ver)
+ {
+ 	sdp_list_t *svclass_id, *pfseq, *apseq, *root;
+@@ -1440,10 +1633,34 @@ static struct a2dp_server *find_server(GSList *list, const bdaddr_t *src)
+ 	return NULL;
+ }
+ 
++static int hiby_conf_int(GKeyFile *config, const char *key, int def)
++{
++	GError *err = NULL;
++	char *str;
++	int val;
++
++	str = g_key_file_get_string(config, "A2DP", key, &err);
++	if (err) {
++		DBG("audio.conf: %s", err->message);
++		g_clear_error(&err);
++		return def;
++	}
++
++	val = atoi(str);
++	g_free(str);
++	return val;
++}
++
+ int a2dp_register(DBusConnection *conn, const bdaddr_t *src, GKeyFile *config)
+ {
+ 	int sbc_srcs = 0, sbc_sinks = 0;
+ 	int mpeg12_srcs = 0, mpeg12_sinks = 0;
++	/* HiBy codecs */
++	int aac_srcs = 0, aptx_srcs = 0, ldac_srcs = 0, uat_srcs = 0;
++	int uat_tws_srcs = 0;
++	int aac_sinks = 0, aptx_sinks = 0, ldac_sinks = 0, uat_sinks = 0;
++	int uat_tws_sinks = 0;
++	gboolean aptx_bridge;
+ 	gboolean source = TRUE, sink = FALSE, socket = FALSE;
+ 	gboolean delay_reporting = FALSE;
+ 	char *str;
+@@ -1526,6 +1743,21 @@ int a2dp_register(DBusConnection *conn, const bdaddr_t *src, GKeyFile *config)
+ 		g_free(str);
+ 	}
+ 
++	/* HiBy: aptX needs the licensed encoder bridge to be present */
++	aptx_bridge = access("/usr/lib/libbt-aptx-bridge.so", F_OK) == 0;
++	if (aptx_bridge) {
++		aptx_srcs = hiby_conf_int(config, "APTXSources", 0);
++		aptx_sinks = hiby_conf_int(config, "APTXSinks", 0);
++	}
++	ldac_srcs = hiby_conf_int(config, "LDACSources", 0);
++	uat_srcs = hiby_conf_int(config, "UATSources", 0);
++	uat_tws_srcs = hiby_conf_int(config, "UAT_TWS_Sources", 0);
++	aac_srcs = hiby_conf_int(config, "AACSources", 0);
++	ldac_sinks = hiby_conf_int(config, "LDACSinks", 0);
++	uat_sinks = hiby_conf_int(config, "UATSinks", 0);
++	uat_tws_sinks = hiby_conf_int(config, "UAT_TWS_Sinks", 0);
++	aac_sinks = hiby_conf_int(config, "AACSinks", 0);
++
+ proceed:
+ 	if (!connection)
+ 		connection = dbus_connection_ref(conn);
+@@ -1557,7 +1789,35 @@ proceed:
+ 	else
+ 		server->version = 0x0102;
+ 
++	a2dp_ldac_support = ldac_srcs + ldac_sinks;
++	a2dp_aptx_support = aptx_srcs + aptx_sinks;
++	a2dp_uat_support = uat_srcs + uat_sinks;
++	a2dp_uat_tws_support = uat_tws_srcs + uat_tws_sinks;
++	a2dp_aac_support = aac_srcs + aac_sinks;
++
++#define ADD_VENDOR(t, n, vid, cid) \
++	for (i = 0; i < (n); i++) \
++		a2dp_add_sep_ex(src, t, A2DP_CODEC_VENDOR, vid, cid, \
++				delay_reporting, NULL, NULL, NULL, NULL)
++#define ADD_STD(t, n, codec) \
++	for (i = 0; i < (n); i++) \
++		a2dp_add_sep(src, t, codec, delay_reporting, \
++				NULL, NULL, NULL, NULL)
++
++	/* Registration order = SEID order = remote's preference order.
++	 * Matches HiBy stock: LDAC, aptX, UAT, UAT-TWS, AAC, SBC, MPEG12. */
+ 	server->source_enabled = source;
++	if (source) {
++		ADD_VENDOR(AVDTP_SEP_TYPE_SOURCE, ldac_srcs, LDAC_VENDOR_ID,
++							LDAC_CODEC_ID);
++		ADD_VENDOR(AVDTP_SEP_TYPE_SOURCE, aptx_srcs, APTX_VENDOR_ID,
++							APTX_CODEC_ID);
++		ADD_VENDOR(AVDTP_SEP_TYPE_SOURCE, uat_srcs, UAT_VENDOR_ID,
++							UAT_CODEC_ID);
++		ADD_VENDOR(AVDTP_SEP_TYPE_SOURCE, uat_tws_srcs, UAT_VENDOR_ID,
++							UAT_TWS_CODEC_ID);
++		ADD_STD(AVDTP_SEP_TYPE_SOURCE, aac_srcs, A2DP_CODEC_MPEG24);
++	}
+ 	if (source) {
+ 		for (i = 0; i < sbc_srcs; i++)
+ 			a2dp_add_sep(src, AVDTP_SEP_TYPE_SOURCE,
+@@ -1570,6 +1830,16 @@ proceed:
+ 					NULL, NULL, NULL, NULL);
+ 	}
+ 	server->sink_enabled = sink;
++	if (sink) {
++		ADD_VENDOR(AVDTP_SEP_TYPE_SINK, ldac_sinks, LDAC_VENDOR_ID,
++							LDAC_CODEC_ID);
++		ADD_VENDOR(AVDTP_SEP_TYPE_SINK, aptx_sinks, APTX_VENDOR_ID,
++							APTX_CODEC_ID);
++		ADD_VENDOR(AVDTP_SEP_TYPE_SINK, uat_sinks, UAT_VENDOR_ID,
++							UAT_CODEC_ID);
++		ADD_VENDOR(AVDTP_SEP_TYPE_SINK, uat_tws_sinks, UAT_VENDOR_ID,
++							UAT_TWS_CODEC_ID);
++	}
+ 	if (sink) {
+ 		for (i = 0; i < sbc_sinks; i++)
+ 			a2dp_add_sep(src, AVDTP_SEP_TYPE_SINK,
+@@ -1580,6 +1850,8 @@ proceed:
+ 			a2dp_add_sep(src, AVDTP_SEP_TYPE_SINK,
+ 					A2DP_CODEC_MPEG12, delay_reporting,
+ 					NULL, NULL, NULL, NULL);
++
++		ADD_STD(AVDTP_SEP_TYPE_SINK, aac_sinks, A2DP_CODEC_MPEG24);
+ 	}
+ 
+ 	return 0;
+@@ -1632,6 +1904,42 @@ struct a2dp_sep *a2dp_add_sep(const bdaddr_t *src, uint8_t type,
+ 				struct a2dp_endpoint *endpoint,
+ 				void *user_data, GDestroyNotify destroy,
+ 				int *err)
++{
++	return a2dp_add_sep_ex(src, type, codec, 0, 0, delay_reporting,
++					endpoint, user_data, destroy, err);
++}
++
++static struct avdtp_sep_ind *hiby_codec_ind(uint8_t codec, uint32_t vid,
++								uint16_t cid)
++{
++	switch (codec) {
++	case A2DP_CODEC_SBC:
++		return &sbc_ind;
++	case A2DP_CODEC_MPEG12:
++		return &mpeg_ind;
++	case A2DP_CODEC_MPEG24:
++		return &aac_ind;
++	case A2DP_CODEC_VENDOR:
++		if (vid == APTX_VENDOR_ID && cid == APTX_CODEC_ID)
++			return &aptx_ind;
++		if (vid == LDAC_VENDOR_ID && cid == LDAC_CODEC_ID)
++			return &ldac_ind;
++		if (vid == UAT_VENDOR_ID && cid == UAT_CODEC_ID)
++			return &uat_ind;
++		if (vid == UAT_VENDOR_ID && cid == UAT_TWS_CODEC_ID)
++			return &uat_tws_ind;
++		break;
++	}
++
++	return NULL;
++}
++
++struct a2dp_sep *a2dp_add_sep_ex(const bdaddr_t *src, uint8_t type,
++				uint8_t codec, uint32_t vendor_id,
++				uint16_t codec_id, gboolean delay_reporting,
++				struct a2dp_endpoint *endpoint,
++				void *user_data, GDestroyNotify destroy,
++				int *err)
+ {
+ 	struct a2dp_server *server;
+ 	struct a2dp_sep *sep;
+@@ -1666,11 +1974,21 @@ struct a2dp_sep *a2dp_add_sep(const bdaddr_t *src, uint8_t type,
+ 		goto proceed;
+ 	}
+ 
+-	ind = (codec == A2DP_CODEC_MPEG12) ? &mpeg_ind : &sbc_ind;
++	ind = hiby_codec_ind(codec, vendor_id, codec_id);
++	if (ind == NULL) {
++		g_free(sep);
++		if (err)
++			*err = -EINVAL;
++		return NULL;
++	}
++
++	DBG("Register codec %02X vid %04X cid %04X as %s", codec, vendor_id,
++			codec_id, type == AVDTP_SEP_TYPE_SOURCE ? "Source" : "Sink");
+ 
+ proceed:
+ 	sep->lsep = avdtp_register_sep(&server->src, type,
+ 					AVDTP_MEDIA_TYPE_AUDIO, codec,
++					vendor_id, codec_id,
+ 					delay_reporting, ind, &cfm, sep);
+ 	if (sep->lsep == NULL) {
+ 		g_free(sep);
+@@ -1682,6 +2000,8 @@ proceed:
+ 	sep->server = server;
+ 	sep->endpoint = endpoint;
+ 	sep->codec = codec;
++	sep->vendor_id = vendor_id;
++	sep->codec_id = codec_id;
+ 	sep->type = type;
+ 	sep->delay_reporting = delay_reporting;
+ 	sep->user_data = user_data;
+@@ -1786,6 +2106,16 @@ struct a2dp_sep *a2dp_get(struct avdtp *session,
+ 		if (sep->codec != codec_cap->media_codec_type)
+ 			continue;
+ 
++		/* HiBy: vendor codecs must match vendor/codec id too */
++		if (sep->codec == A2DP_CODEC_VENDOR) {
++			a2dp_vendor_codec_t *vc = (void *) codec_cap->data;
++
++			if (cap->length < 2 + sizeof(*vc) ||
++				btohl(vc->vendor_id) != sep->vendor_id ||
++				btohs(vc->codec_id) != sep->codec_id)
++				continue;
++		}
++
+ 		if (!sep->stream || avdtp_has_stream(session, sep->stream))
+ 			return sep;
+ 	}
+@@ -1902,6 +2232,151 @@ static gboolean select_sbc_params(struct sbc_codec_cap *cap,
+ 	return TRUE;
+ }
+ 
++/* HiBy: pick first bit of 'avail' in 'order' (0 if none) */
++static uint8_t hiby_pick(uint8_t avail, const uint8_t *order, int n)
++{
++	int i;
++
++	for (i = 0; i < n; i++)
++		if (avail & order[i])
++			return order[i];
++	return 0;
++}
++
++/* LDAC transport rate. 44.1 kHz is preferred by default: most music is
++ * 44.1 kHz, so no resampling is needed, and the LDAC encoder (which runs on
++ * the player's single X1000 core) has less than half the samples to encode
++ * than at 96 kHz. Verified that the stock player plays correctly at
++ * whatever rate is negotiated. A player may still ask for another rate
++ * while it runs by writing "<rate> <pid>" to this file. */
++#define HIBY_PREFER_RATE_PATH "/tmp/bt_prefer_rate"
++
++static unsigned int hiby_preferred_rate(void)
++{
++	unsigned int rate = 0;
++	long pid = 0;
++	char proc[32];
++	FILE *f = fopen(HIBY_PREFER_RATE_PATH, "r");
++
++	if (!f)
++		return 0;
++	/* "<rate> <pid>": honoured only while the writing player is alive */
++	if (fscanf(f, "%u %ld", &rate, &pid) != 2)
++		rate = 0;
++	fclose(f);
++	snprintf(proc, sizeof(proc), "/proc/%ld", pid);
++	if (rate && (pid <= 0 || access(proc, F_OK) != 0)) {
++		DBG("ignoring %s: pid %ld gone", HIBY_PREFER_RATE_PATH, pid);
++		return 0;
++	}
++	return rate;
++}
++
++/* Build our configuration for a remote AAC/vendor codec. 'r' is the remote
++ * media-codec info (media type, codec, ...). Returns length or 0. */
++static size_t hiby_select_params(const uint8_t *r, size_t rlen, uint8_t *out)
++{
++	static const uint8_t ldac_f_96k[] = { 0x04, 0x08, 0x10, 0x20 };
++	static const uint8_t ldac_f_44k1[] = { 0x20, 0x10, 0x08, 0x04 };
++	static const uint8_t ldac_f_48k[] = { 0x10, 0x20, 0x04, 0x08 };
++	const uint8_t *ldac_f = ldac_f_44k1;
++	static const uint8_t ldac_c[] = { 0x01, 0x02, 0x04 };
++	static const uint8_t uat_f[] = { 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
++	static const uint8_t tws_f[] = { 0x08, 0x04, 0x02, 0x01 };
++	static const uint8_t uat_c[] = { 0x04, 0x02, 0x01 };
++	static const uint8_t aptx_f[] = { 0x02, 0x01, 0x04, 0x08 };
++	static const uint8_t aptx_c[] = { 0x02, 0x01 };
++	uint32_t vid;
++	uint16_t cid;
++	uint8_t f, c;
++
++	if (r[1] == A2DP_CODEC_MPEG24) {
++		if (rlen < 8)
++			return 0;
++		memset(out, 0, 8);
++		out[1] = A2DP_CODEC_MPEG24;
++		if (r[2] & 0x40)
++			out[2] = 0x40;			/* MPEG-4 AAC LC */
++		else if (r[2] & 0x80)
++			out[2] = 0x80;			/* MPEG-2 AAC LC */
++		else {
++			error("No supported aac object type");
++			return 0;
++		}
++		if (r[3] & 0x01)
++			out[3] = 0x01;			/* 44.1 kHz */
++		else if (r[4] & 0x80)
++			out[4] |= 0x80;			/* 48 kHz */
++		else {
++			error("No supported frequencies");
++			return 0;
++		}
++		if (r[4] & 0x04)
++			out[4] |= 0x04;			/* 2 channels */
++		else if (r[4] & 0x08)
++			out[4] |= 0x08;			/* 1 channel */
++		else {
++			error("No supported channel modes");
++			return 0;
++		}
++		out[4] |= r[4] & 0x03;			/* rfa */
++		out[5] = 0x04 | (r[5] & 0x80);		/* VBR as remote */
++		out[6] = 0xe2;				/* 320 kb/s */
++		out[7] = 0x00;
++		return 8;
++	}
++
++	if (r[1] != A2DP_CODEC_VENDOR || rlen < 9)
++		return 0;
++
++	vid = r[2] | r[3] << 8 | r[4] << 16 | (uint32_t) r[5] << 24;
++	cid = r[6] | r[7] << 8;
++	memcpy(out, r, 8);
++	out[0] = 0x00;
++
++	if (vid == APTX_VENDOR_ID && cid == APTX_CODEC_ID) {
++		f = hiby_pick(r[8] >> 4, aptx_f, sizeof(aptx_f));
++		c = hiby_pick(r[8] & 0x0f, aptx_c, sizeof(aptx_c));
++		if (!f || !c) {
++			error("No supported aptX configuration");
++			return 0;
++		}
++		out[8] = f << 4 | c;
++		return 9;
++	}
++
++	if (rlen < 10)
++		return 0;
++
++	if (vid == LDAC_VENDOR_ID && cid == LDAC_CODEC_ID) {
++		switch (hiby_preferred_rate()) {
++		case 48000:
++			ldac_f = ldac_f_48k;
++			break;
++		case 96000:
++			ldac_f = ldac_f_96k;
++			break;
++		}
++		f = hiby_pick(r[8], ldac_f, sizeof(ldac_f_44k1));
++		c = hiby_pick(r[9], ldac_c, sizeof(ldac_c));
++	} else if (vid == UAT_VENDOR_ID && cid == UAT_CODEC_ID) {
++		f = hiby_pick(r[8], uat_f, sizeof(uat_f));
++		c = hiby_pick(r[9], uat_c, sizeof(uat_c));
++	} else if (vid == UAT_VENDOR_ID && cid == UAT_TWS_CODEC_ID) {
++		f = hiby_pick(r[8], tws_f, sizeof(tws_f));
++		c = hiby_pick(r[9], uat_c, sizeof(uat_c));
++	} else
++		return 0;
++
++	if (!f || !c) {
++		error("No supported vendor codec configuration");
++		return 0;
++	}
++	out[8] = f;
++	out[9] = c;
++	return 10;
++}
++
+ static gboolean select_capabilities(struct avdtp *session,
+ 					struct avdtp_remote_sep *rsep,
+ 					GSList **caps)
+@@ -1909,19 +2384,36 @@ static gboolean select_capabilities(struct avdtp *session,
+ 	struct avdtp_service_capability *media_transport, *media_codec;
+ 	struct sbc_codec_cap sbc_cap;
+ 
++	uint8_t vcfg[16];
++	size_t vlen = 0;
++	struct avdtp_media_codec_capability *rcodec;
++
+ 	media_codec = avdtp_get_codec(rsep);
+ 	if (!media_codec)
+ 		return FALSE;
+ 
+-	select_sbc_params(&sbc_cap, (struct sbc_codec_cap *) media_codec->data);
++	rcodec = (void *) media_codec->data;
++	if (rcodec->media_codec_type != A2DP_CODEC_SBC) {
++		/* HiBy: AAC / vendor codecs */
++		vlen = hiby_select_params(media_codec->data,
++						media_codec->length, vcfg);
++		if (vlen == 0)
++			return FALSE;
++	} else
++		select_sbc_params(&sbc_cap,
++				(struct sbc_codec_cap *) media_codec->data);
+ 
+ 	media_transport = avdtp_service_cap_new(AVDTP_MEDIA_TRANSPORT,
+ 						NULL, 0);
+ 
+ 	*caps = g_slist_append(*caps, media_transport);
+ 
+-	media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, &sbc_cap,
+-						sizeof(sbc_cap));
++	if (vlen)
++		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, vcfg,
++								vlen);
++	else
++		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC,
++						&sbc_cap, sizeof(sbc_cap));
+ 
+ 	*caps = g_slist_append(*caps, media_codec);
+ 
+@@ -2392,6 +2884,11 @@ gboolean a2dp_sep_get_lock(struct a2dp_sep *sep)
+ 	return sep->locked;
+ }
+ 
++gboolean a2dp_sep_is_streaming(struct a2dp_sep *sep)
++{
++	return avdtp_sep_get_state(sep->lsep) == AVDTP_STATE_STREAMING;
++}
++
+ static int stream_cmp(gconstpointer data, gconstpointer user_data)
+ {
+ 	const struct a2dp_sep *sep = data;
+@@ -2434,3 +2931,78 @@ struct avdtp_stream *a2dp_sep_get_stream(struct a2dp_sep *sep)
+ {
+ 	return sep->stream;
+ }
++
++/* HiBy: is this remote vendor codec one we registered locally? */
++gboolean a2dp_codec_support(struct avdtp_media_codec_capability *codec)
++{
++	a2dp_vendor_codec_t *vc = (void *) codec->data;
++	uint32_t vid = btohl(vc->vendor_id);
++	uint16_t cid = btohs(vc->codec_id);
++
++	if (vid == APTX_VENDOR_ID && cid == APTX_CODEC_ID)
++		return a2dp_aptx_support > 0;
++	if (vid == LDAC_VENDOR_ID && cid == LDAC_CODEC_ID)
++		return a2dp_ldac_support > 0;
++	if (vid == UAT_VENDOR_ID && cid == UAT_CODEC_ID)
++		return a2dp_uat_support > 0;
++	if (vid == UAT_VENDOR_ID && cid == UAT_TWS_CODEC_ID)
++		return a2dp_uat_tws_support > 0;
++
++	return FALSE;
++}
++
++uint8_t a2dp_get_sep_codec(struct a2dp_sep *sep)
++{
++	return sep->codec;
++}
++
++uint32_t a2dp_get_sep_vendor_id(struct a2dp_sep *sep)
++{
++	return sep->vendor_id;
++}
++
++uint16_t a2dp_get_sep_codec_id(struct a2dp_sep *sep)
++{
++	return sep->codec_id;
++}
++
++/* HiBy: reconfigure an already-open stream in place (same SEP, new codec
++ * parameters) with AVDTP RECONFIGURE instead of close + reopen. */
++unsigned int a2dp_reconfig(struct avdtp *session, struct a2dp_sep *sep,
++				a2dp_config_cb_t cb, GSList *caps,
++				void *user_data)
++{
++	struct a2dp_setup_cb *cb_data;
++	struct a2dp_setup *setup;
++
++	if (!sep->stream || avdtp_sep_get_state(sep->lsep) != AVDTP_STATE_OPEN)
++		return 0;
++
++	setup = a2dp_setup_get(session);
++	if (!setup)
++		return 0;
++
++	cb_data = setup_cb_new(setup);
++	cb_data->config_cb = cb;
++	cb_data->user_data = user_data;
++
++	setup->sep = sep;
++	setup->stream = sep->stream;
++	setup->rsep = avdtp_stream_get_remote_sep(sep->stream);
++
++	if (setup->caps != caps) {
++		g_slist_free_full(setup->caps, g_free);
++		setup->caps = g_slist_copy(caps);
++	}
++
++	DBG("a2dp_reconfig: selected SEP %p", sep->lsep);
++
++	setup->inplace_reconf = TRUE;
++	if (avdtp_reconfigure(session, caps, sep->stream) < 0) {
++		setup->inplace_reconf = FALSE;
++		setup_cb_free(cb_data);
++		return 0;
++	}
++
++	return cb_data->id;
++}
+diff --git a/audio/a2dp.h b/audio/a2dp.h
+index 887c5ac..2ccb3f4 100644
+--- a/audio/a2dp.h
++++ b/audio/a2dp.h
+@@ -164,6 +164,18 @@ typedef void (*a2dp_stream_cb_t) (struct avdtp *session,
+ int a2dp_register(DBusConnection *conn, const bdaddr_t *src, GKeyFile *config);
+ void a2dp_unregister(const bdaddr_t *src);
+ 
++unsigned int a2dp_reconfig(struct avdtp *session, struct a2dp_sep *sep,
++				a2dp_config_cb_t cb, GSList *caps,
++				void *user_data);
++struct a2dp_sep *a2dp_add_sep_ex(const bdaddr_t *src, uint8_t type,
++				uint8_t codec, uint32_t vendor_id,
++				uint16_t codec_id, gboolean delay_reporting,
++				struct a2dp_endpoint *endpoint,
++				void *user_data, GDestroyNotify destroy,
++				int *err);
++uint8_t a2dp_get_sep_codec(struct a2dp_sep *sep);
++uint32_t a2dp_get_sep_vendor_id(struct a2dp_sep *sep);
++uint16_t a2dp_get_sep_codec_id(struct a2dp_sep *sep);
+ struct a2dp_sep *a2dp_add_sep(const bdaddr_t *src, uint8_t type,
+ 				uint8_t codec, gboolean delay_reporting,
+ 				struct a2dp_endpoint *endpoint,
+@@ -189,6 +201,7 @@ gboolean a2dp_cancel(struct audio_device *dev, unsigned int id);
+ gboolean a2dp_sep_lock(struct a2dp_sep *sep, struct avdtp *session);
+ gboolean a2dp_sep_unlock(struct a2dp_sep *sep, struct avdtp *session);
+ gboolean a2dp_sep_get_lock(struct a2dp_sep *sep);
++gboolean a2dp_sep_is_streaming(struct a2dp_sep *sep);
+ struct avdtp_stream *a2dp_sep_get_stream(struct a2dp_sep *sep);
+ struct a2dp_sep *a2dp_get_sep(struct avdtp *session,
+ 				struct avdtp_stream *stream);
+diff --git a/audio/hiby-codecs.h b/audio/hiby-codecs.h
+new file mode 100644
+index 0000000..3011984
+--- /dev/null
++++ b/audio/hiby-codecs.h
+@@ -0,0 +1,27 @@
++/*
++ * HiBy vendor A2DP codec identifiers (aptX, LDAC, UAT, UAT-TWS) as used by
++ * HiBy R3 Pro fw 2.2 bluetoothd and its ALSA plugin.
++ */
++#ifndef __HIBY_CODECS_H
++#define __HIBY_CODECS_H
++
++#include <stdint.h>
++
++#ifndef A2DP_CODEC_VENDOR
++#define A2DP_CODEC_VENDOR		0xFF
++#endif
++
++#define APTX_VENDOR_ID			0x0000004F
++#define APTX_CODEC_ID			0x0001
++#define LDAC_VENDOR_ID			0x0000012D
++#define LDAC_CODEC_ID			0x00AA
++#define UAT_VENDOR_ID			0x000006CC
++#define UAT_CODEC_ID			0x0001
++#define UAT_TWS_CODEC_ID		0x0002
++
++typedef struct {
++	uint32_t vendor_id;
++	uint16_t codec_id;
++} __attribute__ ((packed)) a2dp_vendor_codec_t;
++
++#endif /* __HIBY_CODECS_H */
+diff --git a/audio/ipc.h b/audio/ipc.h
+index 61ae019..c03b8f4 100644
+--- a/audio/ipc.h
++++ b/audio/ipc.h
+@@ -141,6 +141,15 @@ struct bt_get_capabilities_req {
+ #define BT_A2DP_ATRAC_SINK			0x07
+ #define BT_A2DP_UNKNOWN_SOURCE			0x08
+ #define BT_A2DP_UNKNOWN_SINK			0x09
++/* HiBy vendor codec extensions (must match libasound_module_pcm_bluetooth) */
++#define BT_A2DP_APTX_SOURCE			0x0A
++#define BT_A2DP_APTX_SINK			0x0B
++#define BT_A2DP_LDAC_SOURCE			0x0C
++#define BT_A2DP_LDAC_SINK			0x0D
++#define BT_A2DP_UAT_SOURCE			0x0E
++#define BT_A2DP_UAT_SINK			0x0F
++#define BT_A2DP_UAT_TWS_SOURCE			0xB0
++#define BT_A2DP_UAT_TWS_SINK			0xB1
+ 
+ #define BT_SBC_SAMPLING_FREQ_16000		(1 << 3)
+ #define BT_SBC_SAMPLING_FREQ_32000		(1 << 2)
+@@ -219,6 +228,29 @@ typedef struct {
+ 	uint16_t sampling_rate;
+ } __attribute__ ((packed)) pcm_capabilities_t;
+ 
++/* HiBy codec extensions. AAC carries the 6 raw A2DP AAC codec-info bytes. */
++typedef struct {
++	codec_capabilities_t capability;
++	uint8_t data[6];
++} __attribute__ ((packed)) aac_capabilities_t;
++
++typedef struct {
++	codec_capabilities_t capability;
++	uint8_t channel_mode;		/* low nibble of aptX codec-info byte */
++	uint8_t frequency;		/* high nibble of aptX codec-info byte */
++} __attribute__ ((packed)) aptx_capabilities_t;
++
++typedef struct {
++	codec_capabilities_t capability;
++	uint8_t frequency;
++	uint8_t channel_mode;
++} __attribute__ ((packed)) ldac_capabilities_t;
++
++typedef struct {
++	codec_capabilities_t capability;
++	uint8_t data[2];
++} __attribute__ ((packed)) uat_capabilities_t;
++
+ struct bt_get_capabilities_rsp {
+ 	bt_audio_msg_header_t	h;
+ 	char			source[18];	/* Address of the local Device */
+@@ -251,6 +283,8 @@ struct bt_set_configuration_req {
+ struct bt_set_configuration_rsp {
+ 	bt_audio_msg_header_t	h;
+ 	uint16_t		link_mtu;	/* Max length that transport supports */
++	uint16_t		imtu;		/* HiBy: plugin needs both MTUs */
++	uint16_t		omtu;
+ } __attribute__ ((packed));
+ 
+ #define BT_STREAM_ACCESS_READ		0

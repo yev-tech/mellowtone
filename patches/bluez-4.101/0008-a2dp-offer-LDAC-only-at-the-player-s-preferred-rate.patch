@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yev-tech <347553623+yev-tech@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 22:15:24 -0400
+Subject: [PATCH] a2dp: offer LDAC only at the player's preferred rate
+
+A remote that sets up the stream itself picks the highest LDAC rate it is
+offered. The Sony WH-1000XM4 chose 96 kHz, and upsampling plus LDAC
+encoding at that rate on the single X1000 core stuttered. The LDAC
+capability now offers only the preferred rate (44.1 kHz by default, from
+/tmp/bt_prefer_rate); with no player running, the stock rate set.
+---
+ audio/a2dp.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/audio/a2dp.c b/audio/a2dp.c
+index a25b573..afadd45 100644
+--- a/audio/a2dp.c
++++ b/audio/a2dp.c
+@@ -1403,7 +1403,31 @@ static gboolean fn(struct avdtp *session, struct avdtp_local_sep *sep,	\
+ 
+ HIBY_GETCAP(aac_getcap_ind, aac_codec_info, "AAC")
+ HIBY_GETCAP(aptx_getcap_ind, aptx_codec_info, "APTX")
+-HIBY_GETCAP(ldac_getcap_ind, ldac_codec_info, "LDAC")
++static unsigned int hiby_preferred_rate(void);
++
++/* LDAC: offer only the player's preferred rate. A remote that configures
++ * the stream itself (Sony WH-1000XM4) otherwise takes the highest rate it
++ * sees, 96 kHz: on the single X1000 core, upsampling plus LDAC encoding at
++ * that rate stuttered. Without a running player (no preference) the stock
++ * rate set is offered. Bits: 0x20 44.1 kHz, 0x10 48, 0x08 88.2, 0x04 96. */
++static gboolean ldac_getcap_ind(struct avdtp *session, struct avdtp_local_sep *sep,
++			gboolean get_all, GSList **caps, uint8_t *err,
++			void *user_data)
++{
++	uint8_t info[sizeof(ldac_codec_info)];
++
++	memcpy(info, ldac_codec_info, sizeof(info));
++	switch (hiby_preferred_rate()) {
++	case 44100:
++		info[8] = 0x20;
++		break;
++	case 48000:
++		info[8] = 0x10;
++		break;
++	}
++	return hiby_getcap(user_data, sep, get_all, caps, info, sizeof(info),
++								"LDAC");
++}
+ HIBY_GETCAP(uat_getcap_ind, uat_codec_info, "UAT")
+ HIBY_GETCAP(uat_tws_getcap_ind, uat_tws_codec_info, "UAT TWS")
+ 

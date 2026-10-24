@@ -1,0 +1,13 @@
+# mt-image: unpacks, checks and repacks firmware images.
+# The recipe is boards/<board>/image/build.sh; its checks B1-B8 are listed in
+# docs/FIRMWARE.md.
+FROM docker.io/library/debian:trixie-slim@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      binutils ca-certificates cpio file genisoimage mtd-utils p7zip-full python3 python3-pip \
+      qemu-user shellcheck squashfs-tools xz-utils \
+ && pip3 install --no-cache-dir --break-system-packages ubi_reader==0.8.10 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

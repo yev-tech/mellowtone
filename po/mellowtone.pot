@@ -1,0 +1,2914 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the mellowtone package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: mellowtone\n"
+"Report-Msgid-Bugs-To: none\n"
+"POT-Creation-Date: 2026-10-15 18:22+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=INTEGER; plural=EXPRESSION;\n"
+
+msgid "File unavailable"
+msgstr ""
+
+msgid "Unsupported audio format"
+msgstr ""
+
+msgid "Too many audio channels"
+msgstr ""
+
+msgid "Audio output failed"
+msgstr ""
+
+msgid "Audio could not be decoded"
+msgstr ""
+
+msgid "Playback error"
+msgstr ""
+
+msgid "Folder too large to index (tap Back)"
+msgstr ""
+
+msgid "Unable to read folder (tap Back and retry)"
+msgstr ""
+
+msgid "Back"
+msgstr ""
+
+msgid "Previous"
+msgstr ""
+
+msgid "No playable files here"
+msgstr ""
+
+msgid "No playable audio files found"
+msgstr ""
+
+msgid "Open a folder containing supported audio files."
+msgstr ""
+
+msgid "Next"
+msgstr ""
+
+msgid "Unexpected library response"
+msgstr ""
+
+msgid "On"
+msgstr ""
+
+msgid "Off"
+msgstr ""
+
+msgid "Cannot play folder"
+msgstr ""
+
+msgid "Paused: headphones disconnected"
+msgstr ""
+
+msgid "Queue checkpoint failed; storage may be read-only"
+msgstr ""
+
+msgid "Playback history could not be saved"
+msgstr ""
+
+msgid "Subsonic"
+msgstr ""
+
+msgid "Stream Media"
+msgstr ""
+
+msgid "AirPlay"
+msgstr ""
+
+msgid ""
+"When on, this device is visible to AirPlay senders on your Wi-Fi network -- "
+"stream audio from an iPhone, iPad, or Mac to be played through this device's "
+"own output."
+msgstr ""
+
+msgid "Failed to enable AirPlay"
+msgstr ""
+
+msgid "AirPlay stopped unexpectedly"
+msgstr ""
+
+msgid "Connect"
+msgstr ""
+
+msgid "Forget"
+msgstr ""
+
+msgid "Scanning..."
+msgstr ""
+
+msgid "Rescan"
+msgstr ""
+
+msgid "Connecting"
+msgstr ""
+
+msgid "Connection failed"
+msgstr ""
+
+msgid "Connected"
+msgstr ""
+
+msgid "Paired"
+msgstr ""
+
+msgid "Available"
+msgstr ""
+
+msgid ""
+"When on, this device stays visible and pairable to other Bluetooth devices, "
+"so a phone or computer can stream audio TO it and play through this device's "
+"own output -- using it as an external DAC."
+msgstr ""
+
+msgid "Enable Bluetooth DAC"
+msgstr ""
+
+msgid "Bluetooth DAC"
+msgstr ""
+
+msgid "Enable Bluetooth in settings to use BT DAC mode"
+msgstr ""
+
+msgid "Leave Bluetooth DAC mode?"
+msgstr ""
+
+msgid "Leave"
+msgstr ""
+
+msgid "Cancel"
+msgstr ""
+
+msgid "Bluetooth DAC mode"
+msgstr ""
+
+msgid "This device is now receiving Bluetooth audio"
+msgstr ""
+
+msgid "Waiting for Bluetooth stream…"
+msgstr ""
+
+msgid "Auto"
+msgstr ""
+
+msgid "LDAC Quality"
+msgstr ""
+
+msgid "LDAC Standard"
+msgstr ""
+
+msgid "LDAC Mobile"
+msgstr ""
+
+msgid "LDAC Adaptive"
+msgstr ""
+
+msgid "Quality"
+msgstr ""
+
+msgid "Standard"
+msgstr ""
+
+msgid "Mobile"
+msgstr ""
+
+msgid "Adaptive"
+msgstr ""
+
+msgid "The codec is chosen for each device: connect one to change its codec"
+msgstr ""
+
+msgid "Connected device"
+msgstr ""
+
+#, c-format
+msgid "Auto (%s)"
+msgstr ""
+
+msgid "Its codecs are listed once it has connected"
+msgstr ""
+
+msgid "LDAC quality"
+msgstr ""
+
+msgid "Could not save Bluetooth codec"
+msgstr ""
+
+msgid "Turn Bluetooth off and on to apply"
+msgstr ""
+
+msgid "Still applying the previous choice"
+msgstr ""
+
+msgid "Thread launch failed"
+msgstr ""
+
+msgid "Changing Bluetooth codec…"
+msgstr ""
+
+msgid "Automatic (44.1 kHz)"
+msgstr ""
+
+msgid "Reading supported rates..."
+msgstr ""
+
+msgid "Connect a device to see its supported rates"
+msgstr ""
+
+msgid "Headset may disconnect, manual reconnection might be required"
+msgstr ""
+
+msgid "Sample Rate"
+msgstr ""
+
+msgid "Bluetooth Volume Sync"
+msgstr ""
+
+msgid "Codec"
+msgstr ""
+
+msgid "Speex Resampling"
+msgstr ""
+
+msgid "Hide Unnamed Devices"
+msgstr ""
+
+msgid "Advanced"
+msgstr ""
+
+msgid "Bluetooth"
+msgstr ""
+
+msgid "Bluetooth is off"
+msgstr ""
+
+msgid "Turn on Bluetooth to see paired and nearby devices."
+msgstr ""
+
+msgid "Paired Devices"
+msgstr ""
+
+msgid "No paired devices"
+msgstr ""
+
+msgid "Previously connected accessories will appear here."
+msgstr ""
+
+msgid "Available Devices"
+msgstr ""
+
+msgid "No nearby devices"
+msgstr ""
+
+msgid "Make an accessory discoverable, then tap Rescan."
+msgstr ""
+
+msgid "Unknown format"
+msgstr ""
+
+msgid "Unknown codec"
+msgstr ""
+
+msgid "DLNA Renderer"
+msgstr ""
+
+msgid ""
+"When on, this device is visible to DLNA/UPnP controller apps on your Wi-Fi "
+"network -- cast a track from one to play it here. Pause, mute, volume, and "
+"seek from the controller app aren't supported; use this device's own "
+"controls instead once a track starts."
+msgstr ""
+
+msgid "Service is busy"
+msgstr ""
+
+msgid "DLNA"
+msgstr ""
+
+msgid "Nothing playing"
+msgstr ""
+
+msgid "Tap to browse music"
+msgstr ""
+
+msgid "Music"
+msgstr ""
+
+msgid "Radio"
+msgstr ""
+
+msgid "Stream"
+msgstr ""
+
+msgid "Settings"
+msgstr ""
+
+msgid "Swipe down for Wi-Fi and Bluetooth"
+msgstr ""
+
+msgid "Playlist created"
+msgstr ""
+
+msgid "Failed to create playlist"
+msgstr ""
+
+msgid "Playlist Name"
+msgstr ""
+
+msgid "Song already added"
+msgstr ""
+
+msgid "Added to playlist"
+msgstr ""
+
+msgid "Failed to add to playlist"
+msgstr ""
+
+msgid "+ New Playlist"
+msgstr ""
+
+msgid "Add to Playlist"
+msgstr ""
+
+msgid "Files"
+msgstr ""
+
+msgid "Audio"
+msgstr ""
+
+msgid "Unknown artist"
+msgstr ""
+
+msgid "Unknown album"
+msgstr ""
+
+msgid "Play All"
+msgstr ""
+
+#, c-format
+msgid "%lld track"
+msgid_plural "%lld tracks"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "All Songs"
+msgstr ""
+
+msgid "Recently Added"
+msgstr ""
+
+msgid "Playlist changed. Select a song again."
+msgstr ""
+
+msgid "Playlist is empty"
+msgstr ""
+
+msgid "Start sequentially"
+msgstr ""
+
+msgid "Shuffle from a random song"
+msgstr ""
+
+msgid "Done"
+msgstr ""
+
+msgid "Edit"
+msgstr ""
+
+#, c-format
+msgid "%d track"
+msgid_plural "%d tracks"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Loading tracks…"
+msgstr ""
+
+msgid "Add songs from a song menu."
+msgstr ""
+
+msgid "No tracks found"
+msgstr ""
+
+msgid "Refresh the music database to update this list."
+msgstr ""
+
+#, c-format
+msgid "Previous  •  %d–%d of %d"
+msgstr ""
+
+#, c-format
+msgid "Disc %d"
+msgstr ""
+
+#, c-format
+msgid "Next  •  %d–%d of %d"
+msgstr ""
+
+msgid "Favorites"
+msgstr ""
+
+msgid "Most Played"
+msgstr ""
+
+msgid "Library changed. Open the album again."
+msgstr ""
+
+msgid "Cannot load album tracks"
+msgstr ""
+
+msgid "Artists"
+msgstr ""
+
+msgid "Albums"
+msgstr ""
+
+msgid "Album Artist"
+msgstr ""
+
+#, c-format
+msgid "%d song"
+msgid_plural "%d songs"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Genres"
+msgstr ""
+
+msgid "Recently Played"
+msgstr ""
+
+msgid "Cannot read playlist"
+msgstr ""
+
+msgid "Playlist changed. Try again."
+msgstr ""
+
+msgid "Cannot reorder playlist"
+msgstr ""
+
+msgid "Cannot remove entry"
+msgstr ""
+
+msgid "Removed from playlist"
+msgstr ""
+
+msgid "Playlist unavailable or unreadable"
+msgstr ""
+
+msgid "Cannot delete playlist"
+msgstr ""
+
+msgid "Playlist deleted"
+msgstr ""
+
+msgid "Cannot rename: invalid name or file exists"
+msgstr ""
+
+msgid "Playlist renamed"
+msgstr ""
+
+msgid "Rename Playlist"
+msgstr ""
+
+msgid "Delete playlist?"
+msgstr ""
+
+msgid "The playlist file will be deleted. Music files are kept."
+msgstr ""
+
+msgid "Delete"
+msgstr ""
+
+msgid "Delete Playlist"
+msgstr ""
+
+msgid "System playlists"
+msgstr ""
+
+msgid "Queue"
+msgstr ""
+
+msgid "User playlists"
+msgstr ""
+
+msgid "No user playlists"
+msgstr ""
+
+msgid "Create a playlist above or copy one to the SD card's Playlists folder."
+msgstr ""
+
+msgid "SD card not available"
+msgstr ""
+
+msgid "Playlists"
+msgstr ""
+
+msgid "Not enough memory to load CUE tracks"
+msgstr ""
+
+msgid "Fix tags from MusicBrainz…"
+msgstr ""
+
+#, c-format
+msgid "Track %d"
+msgstr ""
+
+msgid "Tracks"
+msgstr ""
+
+msgid "Couldn't read this .cue file"
+msgstr ""
+
+msgid "Library recovered. Use Settings > Update Music Database to save"
+msgstr ""
+
+msgid "No music database"
+msgstr ""
+
+msgid "Build it now? Large libraries can take several minutes."
+msgstr ""
+
+msgid "Build"
+msgstr ""
+
+msgid "Music database unavailable"
+msgstr ""
+
+msgid "It could not be loaded. Rebuild it now?"
+msgstr ""
+
+msgid "Rebuild"
+msgstr ""
+
+msgid "Update music database?"
+msgstr ""
+
+msgid "Files on the card may have changed."
+msgstr ""
+
+msgid "Update"
+msgstr ""
+
+msgid "Use Settings > Update Music Database"
+msgstr ""
+
+msgid "Later"
+msgstr ""
+
+msgid "No SD card"
+msgstr ""
+
+msgid "Library loaded"
+msgstr ""
+
+msgid ""
+"Refreshing\n"
+"all metadata..."
+msgstr ""
+
+msgid ""
+"Refreshing\n"
+"metadata..."
+msgstr ""
+
+msgid ""
+"Updating\n"
+"music database..."
+msgstr ""
+
+msgid "Preparing metadata refresh..."
+msgstr ""
+
+msgid "Preparing music library..."
+msgstr ""
+
+msgid "No songs to refresh"
+msgstr ""
+
+msgid "Library is busy"
+msgstr ""
+
+msgid "Album unavailable"
+msgstr ""
+
+msgid ""
+"Refreshing\n"
+"all covers..."
+msgstr ""
+
+msgid ""
+"Reloading\n"
+"cover..."
+msgstr ""
+
+msgid "Preparing cover refresh..."
+msgstr ""
+
+msgid "Refresh all covers?"
+msgstr ""
+
+msgid "Removes saved covers and extracts them again. This may take a while."
+msgstr ""
+
+msgid "Refresh"
+msgstr ""
+
+msgid "Refresh all metadata?"
+msgstr ""
+
+msgid "Reads the tags of every song again. This may take a while."
+msgstr ""
+
+msgid "Some covers could not be refreshed"
+msgstr ""
+
+msgid "Could not reload cover"
+msgstr ""
+
+msgid "Covers refreshed"
+msgstr ""
+
+msgid "Cover reloaded"
+msgstr ""
+
+#, c-format
+msgid ""
+"Refreshing covers\n"
+"%d of %d (%d%%)"
+msgstr ""
+
+#, c-format
+msgid ""
+"Reloading cover\n"
+"%d of %d (%d%%)"
+msgstr ""
+
+msgid "Refreshing covers"
+msgstr ""
+
+msgid "Reloading cover"
+msgstr ""
+
+msgid "Preparing metadata refresh"
+msgstr ""
+
+#, c-format
+msgid ""
+"Looking for music files\n"
+"%d items checked"
+msgstr ""
+
+msgid "Looking for music files"
+msgstr ""
+
+#, c-format
+msgid ""
+"Reading tags\n"
+"%d of %d songs (%d%%)"
+msgstr ""
+
+msgid "Saving music database"
+msgstr ""
+
+msgid ""
+"Saving music database\n"
+"This can take a while on large libraries"
+msgstr ""
+
+msgid "Library unavailable. Use Settings > Update Music Database to rebuild"
+msgstr ""
+
+msgid "Library update failed. Check SD card and retry"
+msgstr ""
+
+msgid "Some songs could not be read"
+msgstr ""
+
+msgid "Metadata refreshed"
+msgstr ""
+
+msgid "Library recovered and saved, some folders could not be read"
+msgstr ""
+
+msgid "Library recovered and saved"
+msgstr ""
+
+msgid "Library updated, some folders could not be read"
+msgstr ""
+
+msgid "Library updated"
+msgstr ""
+
+msgid "No SD card – settings won't be saved"
+msgstr ""
+
+msgid ""
+"This card is NTFS, which is read-only here: music plays, nothing is saved. "
+"Use exFAT for full support."
+msgstr ""
+
+msgid "The card has errors and is read-only. Check it on a computer."
+msgstr ""
+
+msgid ""
+"Unsupported card format: nothing is saved. Format it as exFAT or FAT32 on a "
+"computer."
+msgstr ""
+
+msgid "This card has its own settings. Restart to use them."
+msgstr ""
+
+msgid "SD card couldn't be read"
+msgstr ""
+
+msgid "Tap Power off again to confirm"
+msgstr ""
+
+msgid "Tap Restart again to confirm"
+msgstr ""
+
+msgid "Tap again to restart into the recovery menu"
+msgstr ""
+
+#, c-format
+msgid "Sleep timer: %d min remaining"
+msgstr ""
+
+msgid "Sleep timer: Off"
+msgstr ""
+
+#, c-format
+msgid "Showing first %d of %d songs"
+msgstr ""
+
+msgid "Play all shuffled"
+msgstr ""
+
+msgid "Play sequentially"
+msgstr ""
+
+msgid "Add a random song to queue"
+msgstr ""
+
+msgid "Refresh metadata"
+msgstr ""
+
+msgid "Add album to queue"
+msgstr ""
+
+msgid "Reload cover"
+msgstr ""
+
+msgid "Playlists refreshed"
+msgstr ""
+
+msgid "Some playlists could not be read"
+msgstr ""
+
+msgid "No synchronized lyrics found"
+msgstr ""
+
+msgid "Small"
+msgstr ""
+
+msgid "Medium"
+msgstr ""
+
+msgid "Large"
+msgstr ""
+
+msgid "Could not apply lyrics text size"
+msgstr ""
+
+msgid "Lyrics Text Size"
+msgstr ""
+
+msgid "Unknown rate"
+msgstr ""
+
+msgid "Wi-Fi"
+msgstr ""
+
+msgid "Remote"
+msgstr ""
+
+msgid "Import"
+msgstr ""
+
+msgid "Wireless"
+msgstr ""
+
+msgid "Queue changed. Try again."
+msgstr ""
+
+msgid "Queue is empty"
+msgstr ""
+
+msgid "Play an album or playlist to see what comes next."
+msgstr ""
+
+msgid "Last track in the queue"
+msgstr ""
+
+msgid "Nothing plays after this one."
+msgstr ""
+
+msgid "Format"
+msgstr ""
+
+msgid "Title"
+msgstr ""
+
+msgid "Artist"
+msgstr ""
+
+msgid "Album"
+msgstr ""
+
+msgid "Track"
+msgstr ""
+
+msgid "Year"
+msgstr ""
+
+msgid "File"
+msgstr ""
+
+msgid "Sample rate"
+msgstr ""
+
+msgid "Bit depth"
+msgstr ""
+
+msgid "Channels"
+msgstr ""
+
+msgid "Bitrate"
+msgstr ""
+
+msgid "Duration"
+msgstr ""
+
+msgid "Output"
+msgstr ""
+
+msgid "Lyrics saved. Loading..."
+msgstr ""
+
+msgid "LRCLIB has no synced lyrics for this track."
+msgstr ""
+
+msgid "LRCLIB only has unsynced lyrics for this track."
+msgstr ""
+
+msgid "Could not reach lrclib.net. Check Wi-Fi."
+msgstr ""
+
+msgid "lrclib.net is busy. Try again in a minute."
+msgstr ""
+
+msgid "Could not save the .lrc file next to the song."
+msgstr ""
+
+msgid "No lyrics for this track"
+msgstr ""
+
+msgid "Searching lrclib.net..."
+msgstr ""
+
+msgid ""
+"Add a .lrc file with the same name next to the song, or download synced "
+"lyrics from lrclib.net."
+msgstr ""
+
+msgid "Download lyrics"
+msgstr ""
+
+msgid "Edit queue"
+msgstr ""
+
+msgid "Add to playlist"
+msgstr ""
+
+msgid "Go to album"
+msgstr ""
+
+msgid "Go to artist"
+msgstr ""
+
+msgid "Equalizer"
+msgstr ""
+
+msgid "Delete file"
+msgstr ""
+
+msgid "Up next"
+msgstr ""
+
+msgid "Lyrics"
+msgstr ""
+
+msgid "Info"
+msgstr ""
+
+msgid "More"
+msgstr ""
+
+msgid "Connecting…"
+msgstr ""
+
+msgid "Couldn't play this station"
+msgstr ""
+
+msgid "The station may be offline, or the connection dropped."
+msgstr ""
+
+msgid "Retry"
+msgstr ""
+
+msgid "Close"
+msgstr ""
+
+msgid "No track loaded"
+msgstr ""
+
+msgid "Song deleted"
+msgstr ""
+
+msgid "Play in order"
+msgstr ""
+
+msgid "Repeat all"
+msgstr ""
+
+msgid "Repeat one"
+msgstr ""
+
+msgid "Shuffle"
+msgstr ""
+
+#, c-format
+msgid ""
+"Delete %s?\n"
+"This cannot be undone."
+msgstr ""
+
+msgid "Queue ready. Press Play to start."
+msgstr ""
+
+#, c-format
+msgid "Added %d song to queue"
+msgid_plural "Added %d songs to queue"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Removed from queue"
+msgstr ""
+
+msgid "Queue cleared"
+msgstr ""
+
+msgid "Turn off Bluetooth DAC to play music on this device"
+msgstr ""
+
+msgid "Exit USB DAC mode to play music on this device"
+msgstr ""
+
+msgid "Playback error: audio output failed"
+msgstr ""
+
+#, c-format
+msgid "Playback stopped: %s"
+msgstr ""
+
+#, c-format
+msgid "Skipped: %s"
+msgstr ""
+
+#, c-format
+msgid "%s · Not loaded: limit reached"
+msgstr ""
+
+#, c-format
+msgid "%s · Not loaded"
+msgstr ""
+
+msgid "Refreshing plugins..."
+msgstr ""
+
+msgid "Couldn't save -- plugin change was not applied"
+msgstr ""
+
+msgid "Refresh Plugins"
+msgstr ""
+
+msgid "Plugin Manager"
+msgstr ""
+
+msgid "No entries to display"
+msgstr ""
+
+msgid "No plugin settings available"
+msgstr ""
+
+msgid "Plugin"
+msgstr ""
+
+msgid "Plugin Settings"
+msgstr ""
+
+msgid "Played"
+msgstr ""
+
+msgid "Playing"
+msgstr ""
+
+msgid "Queued"
+msgstr ""
+
+msgid "Cannot move this entry"
+msgstr ""
+
+msgid "Play an album or playlist to see its songs here."
+msgstr ""
+
+msgid "Previous page"
+msgstr ""
+
+msgid "Next page"
+msgstr ""
+
+msgid "Cannot start queue"
+msgstr ""
+
+msgid "Saving playlist…"
+msgstr ""
+
+msgid "Cannot save playlist"
+msgstr ""
+
+msgid "Save Queue as Playlist"
+msgstr ""
+
+msgid "Edit / Done"
+msgstr ""
+
+msgid "Clear Queue"
+msgstr ""
+
+msgid "Save as Playlist"
+msgstr ""
+
+msgid "Playlist saved"
+msgstr ""
+
+msgid "Cannot save: invalid or streaming entries"
+msgstr ""
+
+msgid "Play Next"
+msgstr ""
+
+msgid "Add to Queue"
+msgstr ""
+
+msgid "Station removed"
+msgstr ""
+
+msgid "Insert a writable SD card to change the Radio list"
+msgstr ""
+
+msgid "Could not change the Radio list"
+msgstr ""
+
+msgid "Remove"
+msgstr ""
+
+#, c-format
+msgid "Remove %s?"
+msgstr ""
+
+msgid "Removed stations"
+msgstr ""
+
+#, c-format
+msgid "Show removed stations (%d)"
+msgstr ""
+
+msgid "No stations"
+msgstr ""
+
+msgid ""
+"Put Radio.txt in the SD card root: one \"Name | http://stream-url\" per line."
+msgstr ""
+
+msgid "Station restored"
+msgstr ""
+
+msgid "No removed stations"
+msgstr ""
+
+msgid "Every built-in station is shown."
+msgstr ""
+
+msgid "Unavailable"
+msgstr ""
+
+msgid "Turn this on to see the address here."
+msgstr ""
+
+msgid "Bluetooth remote service is unavailable; retrying."
+msgstr ""
+
+msgid "Bluetooth remote service is starting…"
+msgstr ""
+
+msgid "Connect to Wi-Fi to use the remote."
+msgstr ""
+
+msgid "Enable Wi-Fi or Bluetooth to connect."
+msgstr ""
+
+msgid "Bluetooth: registration failed; retrying"
+msgstr ""
+
+msgid "Bluetooth: waiting for service registration"
+msgstr ""
+
+msgid "Connect using either available route:"
+msgstr ""
+
+msgid "Bluetooth: Mellowtone Remote"
+msgstr ""
+
+msgid "Could not generate a new PIN"
+msgstr ""
+
+msgid "New PIN generated"
+msgstr ""
+
+msgid "Generate a new PIN?"
+msgstr ""
+
+msgid ""
+"Apps and browsers using the current PIN will need the new one to reconnect."
+msgstr ""
+
+msgid "Generate"
+msgstr ""
+
+msgid "Remote Control"
+msgstr ""
+
+msgid "Connection PIN"
+msgstr ""
+
+msgid ""
+"Connect over Wi-Fi or Bluetooth to see what's playing, control playback, and "
+"browse your library. Enter this PIN when the app or browser asks for it; "
+"Bluetooth also requires pairing."
+msgstr ""
+
+msgid "Could not start the lookup"
+msgstr ""
+
+msgid "Album to search"
+msgstr ""
+
+msgid "Cannot create the backup folder on the SD card"
+msgstr ""
+
+msgid "Could not start writing"
+msgstr ""
+
+msgid "Changes kept"
+msgstr ""
+
+msgid "Could not start the undo"
+msgstr ""
+
+msgid "Fix tags"
+msgstr ""
+
+#, c-format
+msgid "Looking up \"%s\" on MusicBrainz…"
+msgstr ""
+
+msgid ""
+"Checking the length of each file, then asking MusicBrainz for matching "
+"releases."
+msgstr ""
+
+msgid "Choose the release"
+msgstr ""
+
+#, c-format
+msgid ""
+"Best match first, scored against the %d tracks of the CUE sheet. Nothing is "
+"written yet."
+msgstr ""
+
+#, c-format
+msgid "Best match first, scored against your %d files. Nothing is written yet."
+msgstr ""
+
+msgid "tracks"
+msgstr ""
+
+msgid "Search again"
+msgstr ""
+
+msgid "Review"
+msgstr ""
+
+msgid "Album artist"
+msgstr ""
+
+msgid "Track artists"
+msgstr ""
+
+msgid "Titles"
+msgstr ""
+
+msgid "Track numbers"
+msgstr ""
+
+msgid "Disc numbers"
+msgstr ""
+
+msgid "Genre"
+msgstr ""
+
+msgid "MusicBrainz IDs"
+msgstr ""
+
+msgid "Review changes"
+msgstr ""
+
+#. TRANSLATORS: release date (year), format such as "CD", how well it fits the files.
+#, c-format
+msgid "MusicBrainz · %.4s · %s · %d%% match"
+msgstr ""
+
+msgid "Cover · Cover Art Archive, 500 px"
+msgstr ""
+
+msgid "embedded only"
+msgstr ""
+
+msgid "none"
+msgstr ""
+
+msgid "No tag changes"
+msgstr ""
+
+msgid "These files already match the release."
+msgstr ""
+
+msgid "files"
+msgstr ""
+
+msgid "empty"
+msgstr ""
+
+msgid "Save cover"
+msgstr ""
+
+msgid "Write"
+msgstr ""
+
+msgid "Write 1 file"
+msgstr ""
+
+#, c-format
+msgid "Write %d files"
+msgstr ""
+
+msgid "A tag fix is waiting for your decision"
+msgstr ""
+
+msgid ""
+"Keep the new tags (the backup is deleted) or undo them (the old tags are "
+"written back)."
+msgstr ""
+
+msgid "Cover saved"
+msgstr ""
+
+#, c-format
+msgid "%d file updated"
+msgid_plural "%d files updated"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid ""
+"The library re-read them. Old tags are backed up on the SD card until you "
+"choose."
+msgstr ""
+
+msgid "Cover saved as cover.jpg."
+msgstr ""
+
+msgid "The Cover Art Archive has no front cover for this release."
+msgstr ""
+
+msgid "The cover could not be downloaded."
+msgstr ""
+
+#, c-format
+msgid "%d file was skipped (playing now, or format not supported)."
+msgid_plural "%d files were skipped (playing now, or format not supported)."
+msgstr[0] ""
+msgstr[1] ""
+
+#, c-format
+msgid "%d file could not be written and was left unchanged."
+msgid_plural "%d files could not be written and were left unchanged."
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Undo"
+msgstr ""
+
+msgid "Keep"
+msgstr ""
+
+msgid "Writing tags…"
+msgstr ""
+
+msgid "Each file is written to a copy, checked, then swapped in."
+msgstr ""
+
+msgid "Restoring the old tags…"
+msgstr ""
+
+msgid "MusicBrainz could not be reached"
+msgstr ""
+
+msgid "Check the Wi-Fi connection and try again."
+msgstr ""
+
+msgid "MusicBrainz is busy"
+msgstr ""
+
+msgid "Try again in a minute."
+msgstr ""
+
+msgid "No matching release found"
+msgstr ""
+
+msgid "Try Search again with a shorter album name."
+msgstr ""
+
+msgid "Nothing was written"
+msgstr ""
+
+msgid "The files could not be written; they were left unchanged."
+msgstr ""
+
+msgid "No file needed a change."
+msgstr ""
+
+msgid "Changes undone"
+msgstr ""
+
+msgid "The previous tags are back and the backup was deleted."
+msgstr ""
+
+#, c-format
+msgid "%d files could not be restored; their backup stays on the SD card."
+msgstr ""
+
+msgid "Undo incomplete"
+msgstr ""
+
+msgid "A tag fix is still running"
+msgstr ""
+
+msgid "No CUE sheet for this file"
+msgstr ""
+
+msgid "Fixing a CUE image needs a sheet with at least two tracks."
+msgstr ""
+
+msgid "These songs have no album tag"
+msgstr ""
+
+msgid ""
+"They are not one album, so they can't be looked up together. For a CUE "
+"image, open its .cue in Files and choose Fix tags there."
+msgstr ""
+
+msgid "No songs in this album"
+msgstr ""
+
+msgid "Wi-Fi is not connected"
+msgstr ""
+
+msgid "Fixing tags looks the album up on MusicBrainz."
+msgstr ""
+
+msgid "Custom"
+msgstr ""
+
+#, c-format
+msgid "%d min remaining"
+msgstr ""
+
+#, c-format
+msgid "Pre-Amp: %+.2f dB"
+msgstr ""
+
+#, c-format
+msgid "%.0f Hz"
+msgstr ""
+
+msgid "Pre-Amp (dB, -12 to 12)"
+msgstr ""
+
+msgid "Frequency (Hz, 20 to 20000)"
+msgstr ""
+
+msgid "Gain (dB, -12 to 12)"
+msgstr ""
+
+msgid "OFF"
+msgstr ""
+
+msgid "ON"
+msgstr ""
+
+msgid "EQ curve"
+msgstr ""
+
+#, c-format
+msgid "Band %d / %d"
+msgstr ""
+
+msgid "Peaking"
+msgstr ""
+
+msgid "Low Shelf"
+msgstr ""
+
+msgid "High Shelf"
+msgstr ""
+
+msgid "Could not set the recovery menu flag"
+msgstr ""
+
+msgid "Restart"
+msgstr ""
+
+#, c-format
+msgid ""
+"%s is on the card.\n"
+"Restart into the recovery menu to install it?"
+msgstr ""
+
+msgid "Restart into the recovery menu?"
+msgstr ""
+
+msgid "Mellowtone did not start 3 times: the previous version is running"
+msgstr ""
+
+msgid "Mellowtone crashed repeatedly: the previous version is running"
+msgstr ""
+
+msgid "Mellowtone crashed repeatedly: the factory version is running"
+msgstr ""
+
+msgid "Firmware update available, restart to install"
+msgstr ""
+
+msgid "Player update available, restart to install"
+msgstr ""
+
+msgid "Mellowtone"
+msgstr ""
+
+msgid "Developer Options"
+msgstr ""
+
+msgid "About"
+msgstr ""
+
+msgid "Bluetooth logging stops after a restart"
+msgstr ""
+
+msgid "ADB"
+msgstr ""
+
+msgid "Enable debug logging"
+msgstr ""
+
+msgid "LDAC in DAC mode (Experimental)"
+msgstr ""
+
+msgid "Load covers during playback (Experimental)"
+msgstr ""
+
+msgid "Allow suspend"
+msgstr ""
+
+msgid "Restart into recovery menu"
+msgstr ""
+
+msgid "Custom color"
+msgstr ""
+
+msgid "From album art"
+msgstr ""
+
+msgid "From album art (no cover, using custom)"
+msgstr ""
+
+msgid "Accent Color"
+msgstr ""
+
+msgid "Match album art"
+msgstr ""
+
+msgid "Takes its color from the cover of the playing track"
+msgstr ""
+
+msgid "Presets"
+msgstr ""
+
+msgid "Default (Built-in)"
+msgstr ""
+
+msgid "No .ttf fonts found in /Fonts"
+msgstr ""
+
+msgid "Font selection is no longer available"
+msgstr ""
+
+msgid "Failed to load font. Check format & memory."
+msgstr ""
+
+msgid "Font"
+msgstr ""
+
+msgid "Preview"
+msgstr ""
+
+msgid "The quick brown fox jumps 123"
+msgstr ""
+
+msgid "Custom fonts affect Latin text only."
+msgstr ""
+
+msgid "Place .ttf fonts in SD /Fonts folder."
+msgstr ""
+
+msgid "Screen Timeout"
+msgstr ""
+
+msgid "Turn off screen automatically"
+msgstr ""
+
+msgid "Screen Dimming"
+msgstr ""
+
+msgid "Dim screen before timeout"
+msgstr ""
+
+msgid "Startup Volume"
+msgstr ""
+
+msgid "Launch at a fixed volume"
+msgstr ""
+
+#, c-format
+msgid "%d min"
+msgstr ""
+
+#, c-format
+msgid "%d hr"
+msgstr ""
+
+#, c-format
+msgid "%d hr %d min"
+msgstr ""
+
+#, c-format
+msgid "Time remaining: %d:%02d:%02d"
+msgstr ""
+
+#, c-format
+msgid "Time remaining: %d:%02d"
+msgstr ""
+
+msgid "Sleep Timer"
+msgstr ""
+
+msgid "Enable Sleep Timer"
+msgstr ""
+
+msgid "Show Time Remaining"
+msgstr ""
+
+msgid "Idle Shutdown"
+msgstr ""
+
+msgid "Automatically go idle"
+msgstr ""
+
+msgid "Choose what happens when idle:"
+msgstr ""
+
+msgid "Power Off"
+msgstr ""
+
+msgid "Suspend to RAM"
+msgstr ""
+
+msgid "When idle:"
+msgstr ""
+
+msgid "Idle timeout:"
+msgstr ""
+
+msgid "Africa"
+msgstr ""
+
+msgid "America"
+msgstr ""
+
+msgid "Antarctica"
+msgstr ""
+
+msgid "Arctic"
+msgstr ""
+
+msgid "Asia"
+msgstr ""
+
+msgid "Atlantic"
+msgstr ""
+
+msgid "Australia"
+msgstr ""
+
+msgid "Europe"
+msgstr ""
+
+msgid "Indian"
+msgstr ""
+
+msgid "Pacific"
+msgstr ""
+
+msgid "Not selected (UTC)"
+msgstr ""
+
+msgid "Failed to apply time zone"
+msgstr ""
+
+#, c-format
+msgid "%s (current)"
+msgstr ""
+
+msgid "Time Zone"
+msgstr ""
+
+msgid "Sound Effects"
+msgstr ""
+
+msgid "Download Profiles"
+msgstr ""
+
+msgid "Resume Last Track"
+msgstr ""
+
+msgid "Crossfade"
+msgstr ""
+
+msgid "Gapless"
+msgstr ""
+
+msgid "Buttons & Remote"
+msgstr ""
+
+msgid "Playback & Controls"
+msgstr ""
+
+msgid "Gain"
+msgstr ""
+
+msgid "ReplayGain"
+msgstr ""
+
+msgid "Sound"
+msgstr ""
+
+msgid "Play/Pause Button"
+msgstr ""
+
+msgid "In-line Remote"
+msgstr ""
+
+msgid "Update Music Database to enable this album order"
+msgstr ""
+
+msgid "Sorting"
+msgstr ""
+
+msgid "Files (folders stay first)"
+msgstr ""
+
+msgid "Name (A–Z)"
+msgstr ""
+
+msgid "Newest Modified"
+msgstr ""
+
+msgid "Release Year (oldest first)"
+msgstr ""
+
+msgid "Albums (main list)"
+msgstr ""
+
+msgid ""
+"Files use modification dates. Albums use the newest track added; missing "
+"release years sort last. Update Music Database once to read years from "
+"existing files."
+msgstr ""
+
+msgid "Update Music Database"
+msgstr ""
+
+msgid "Refresh All Metadata"
+msgstr ""
+
+msgid "Refresh All Covers"
+msgstr ""
+
+msgid "Library"
+msgstr ""
+
+msgid "Animation Speed"
+msgstr ""
+
+msgid "High"
+msgstr ""
+
+msgid "Low"
+msgstr ""
+
+msgid "Stock volume table not found"
+msgstr ""
+
+msgid "Font Size"
+msgstr ""
+
+msgid "Drawer Volume Slider"
+msgstr ""
+
+msgid "Battery Percentage"
+msgstr ""
+
+msgid "Artist Images"
+msgstr ""
+
+msgid "Appearance"
+msgstr ""
+
+msgid "Hide Player/Lyrics Top Bar"
+msgstr ""
+
+msgid "Player Layout"
+msgstr ""
+
+msgid "Swipe Up for Home"
+msgstr ""
+
+msgid "Upside Down Screen"
+msgstr ""
+
+msgid "Gestures & Orientation"
+msgstr ""
+
+msgid "Double-tap to Wake"
+msgstr ""
+
+msgid "Display"
+msgstr ""
+
+msgid "Charge Limit (85%)"
+msgstr ""
+
+msgid "Safe Charging (500mA)"
+msgstr ""
+
+msgid "Don't charge in USB DAC mode"
+msgstr ""
+
+msgid "LED charge indicator"
+msgstr ""
+
+msgid "Charging"
+msgstr ""
+
+msgid "Power"
+msgstr ""
+
+msgid "Additional Tools"
+msgstr ""
+
+msgid "Turn off Automatic to set the clock"
+msgstr ""
+
+msgid "Automatic"
+msgstr ""
+
+msgid "Set Time"
+msgstr ""
+
+msgid "24-Hour Clock"
+msgstr ""
+
+msgid "Clock"
+msgstr ""
+
+msgid "Save"
+msgstr ""
+
+msgid "Hostname"
+msgstr ""
+
+msgid "Reset settings"
+msgstr ""
+
+msgid "Maintenance"
+msgstr ""
+
+msgid "Applying language, this may take a while"
+msgstr ""
+
+msgid "Language"
+msgstr ""
+
+msgid "USB Mode"
+msgstr ""
+
+msgid "System"
+msgstr ""
+
+msgid "Gain High"
+msgstr ""
+
+msgid "Gain Medium"
+msgstr ""
+
+msgid "Gain Low"
+msgstr ""
+
+msgid "Always on"
+msgstr ""
+
+msgid "Stays on"
+msgstr ""
+
+msgid "Listening"
+msgstr ""
+
+msgid "Playback"
+msgstr ""
+
+msgid "Streaming"
+msgstr ""
+
+msgid "Device"
+msgstr ""
+
+msgid "Combined response (dB) · EQ off"
+msgstr ""
+
+msgid "Combined response (dB)"
+msgstr ""
+
+msgid "PEQ reset to defaults"
+msgstr ""
+
+msgid "Reset PEQ to defaults?"
+msgstr ""
+
+msgid "Reset"
+msgstr ""
+
+msgid "Reset all settings and reboot?"
+msgstr ""
+
+msgid ""
+"Your settings are kept in .mellowtone/backup on the SD card. Music and "
+"library stay."
+msgstr ""
+
+msgid "Restart now to apply the new hostname?"
+msgstr ""
+
+msgid "Restart Now"
+msgstr ""
+
+msgid "Hostname can only use letters, numbers, and hyphens"
+msgstr ""
+
+msgid "Invalid profile name"
+msgstr ""
+
+msgid "Failed to save profile"
+msgstr ""
+
+msgid "Profile saved"
+msgstr ""
+
+msgid "Failed to load profile"
+msgstr ""
+
+msgid "Profile loaded"
+msgstr ""
+
+msgid "Failed to delete profile"
+msgstr ""
+
+msgid "Profile deleted"
+msgstr ""
+
+msgid "Failed to rename profile"
+msgstr ""
+
+msgid "Profile renamed"
+msgstr ""
+
+msgid "Rename Profile"
+msgstr ""
+
+msgid "Replace Profile"
+msgstr ""
+
+msgid "Profiles"
+msgstr ""
+
+msgid "No saved profiles"
+msgstr ""
+
+msgid "Download profiles"
+msgstr ""
+
+msgid "Delete this profile?"
+msgstr ""
+
+msgid "Save Profile As"
+msgstr ""
+
+msgid "Profile Name"
+msgstr ""
+
+msgid "Save Profile"
+msgstr ""
+
+msgid "Save as a new profile, or replace one that already exists?"
+msgstr ""
+
+msgid "Replace Existing"
+msgstr ""
+
+msgid "New Profile"
+msgstr ""
+
+msgid "Band options"
+msgstr ""
+
+msgid "Filter type"
+msgstr ""
+
+msgid ""
+"Peaking\n"
+"Low Shelf\n"
+"High Shelf"
+msgstr ""
+
+msgid "Enable band"
+msgstr ""
+
+msgid "Reset to defaults"
+msgstr ""
+
+msgid "balanced"
+msgstr ""
+
+msgid "safe"
+msgstr ""
+
+msgid "off"
+msgstr ""
+
+#. TRANSLATORS: preamp gain in dB, then its mode ("balanced", "safe" or "off").
+#, c-format
+msgid "Preamp %+.1f dB · %s"
+msgstr ""
+
+msgid "Flat"
+msgstr ""
+
+msgid "Balanced: louder, limiter catches rare peaks"
+msgstr ""
+
+msgid "Safe: never clips, quietest"
+msgstr ""
+
+msgid "Off: like Winamp, limiter only"
+msgstr ""
+
+msgid "Saved"
+msgstr ""
+
+msgid "Manage saved profiles"
+msgstr ""
+
+msgid "Graphic"
+msgstr ""
+
+msgid "Parametric"
+msgstr ""
+
+msgid "Curve"
+msgstr ""
+
+msgid "Band"
+msgstr ""
+
+msgid "Parametric EQ"
+msgstr ""
+
+msgid "Frequency"
+msgstr ""
+
+msgid "48 kHz reference"
+msgstr ""
+
+msgid "Resume and Play"
+msgstr ""
+
+msgid "Resume, but Paused"
+msgstr ""
+
+msgid "Applies next time you launch the app"
+msgstr ""
+
+msgid "Play/Pause"
+msgstr ""
+
+msgid "Previous Track"
+msgstr ""
+
+msgid "Play/Pause + Previous Track (Double-Click)"
+msgstr ""
+
+msgid "Applies immediately"
+msgstr ""
+
+msgid "Could not apply font size"
+msgstr ""
+
+msgid "Per Track"
+msgstr ""
+
+msgid "Per Album"
+msgstr ""
+
+msgid "Please wait for the library scan to finish"
+msgstr ""
+
+msgid "Connect to a Wi-Fi network before continuing."
+msgstr ""
+
+msgid "Could not start the library scan. Please try again."
+msgstr ""
+
+msgid "Insert an SD card to scan for music, or turn off Scan for music."
+msgstr ""
+
+msgid "Choose a language"
+msgstr ""
+
+msgid "Time zone"
+msgstr ""
+
+msgid "Quick setup"
+msgstr ""
+
+msgid "Skip for now"
+msgstr ""
+
+msgid "Your setup journey"
+msgstr ""
+
+msgid "Welcome to Mellowtone"
+msgstr ""
+
+msgid "Get started"
+msgstr ""
+
+msgid "Quick Setup Complete"
+msgstr ""
+
+msgid "Continue"
+msgstr ""
+
+#, c-format
+msgid "Step %d of %d"
+msgstr ""
+
+msgid "Your music"
+msgstr ""
+
+msgid "Choose the language for your player."
+msgstr ""
+
+msgid "Set your local time zone so the clock is right."
+msgstr ""
+
+msgid "Connect to Wi-Fi for streaming, updates, and online services."
+msgstr ""
+
+msgid ""
+"Insert your SD card with music files. Mellowtone can scan it and build your "
+"library."
+msgstr ""
+
+msgid "Choose time zone"
+msgstr ""
+
+msgid "Add hidden network"
+msgstr ""
+
+msgid "Scan for music"
+msgstr ""
+
+msgid "No SD card detected. You can scan later from Library settings."
+msgstr ""
+
+msgid "AM"
+msgstr ""
+
+msgid "Not available in Mellowtone on this player"
+msgstr ""
+
+msgid "USB audio device detected"
+msgstr ""
+
+#, c-format
+msgid "%dm"
+msgstr ""
+
+msgid "Wi-Fi failed to change state"
+msgstr ""
+
+msgid "Failed to toggle Bluetooth"
+msgstr ""
+
+#, c-format
+msgid "%d min left"
+msgstr ""
+
+msgid "Sleep"
+msgstr ""
+
+msgid "RC"
+msgstr ""
+
+msgid "EQ"
+msgstr ""
+
+msgid "PM"
+msgstr ""
+
+msgid "Previous request still finishing"
+msgstr ""
+
+msgid "Try again"
+msgstr ""
+
+msgid "Wi-Fi not connected"
+msgstr ""
+
+msgid "Picking random songs…"
+msgstr ""
+
+msgid "Stream from your own server"
+msgstr ""
+
+msgid ""
+"A Subsonic server (Navidrome, Gonic, Airsonic) or the DLNA media server of "
+"your NAS."
+msgstr ""
+
+msgid "Add a server"
+msgstr ""
+
+msgid "Recently added"
+msgstr ""
+
+msgid "Loading…"
+msgstr ""
+
+msgid "Nothing to show yet."
+msgstr ""
+
+msgid "Connect to Wi-Fi to browse."
+msgstr ""
+
+msgid "Random mix"
+msgstr ""
+
+#, c-format
+msgid "%s · track %d"
+msgstr ""
+
+msgid "Search isn't available for DLNA servers yet"
+msgstr ""
+
+msgid "Newest"
+msgstr ""
+
+msgid "A–Z"
+msgstr ""
+
+msgid "Most played"
+msgstr ""
+
+msgid "Random"
+msgstr ""
+
+msgid "Couldn't load. Check the connection."
+msgstr ""
+
+msgid "Show more"
+msgstr ""
+
+msgid "No albums"
+msgstr ""
+
+msgid "Searching…"
+msgstr ""
+
+msgid "Nothing found"
+msgstr ""
+
+msgid "Songs"
+msgstr ""
+
+msgid "Search the server"
+msgstr ""
+
+msgid "Servers"
+msgstr ""
+
+msgid "Manage servers"
+msgstr ""
+
+msgid "Settings › Streaming"
+msgstr ""
+
+msgid "In use"
+msgstr ""
+
+msgid "Original"
+msgstr ""
+
+msgid "96 kbps"
+msgstr ""
+
+msgid "192 kbps"
+msgstr ""
+
+msgid "320 kbps"
+msgstr ""
+
+msgid "Stream quality"
+msgstr ""
+
+msgid "Downloads"
+msgstr ""
+
+msgid "Save downloads to"
+msgstr ""
+
+msgid "SD card"
+msgstr ""
+
+msgid "Name"
+msgstr ""
+
+msgid "Address (e.g. http://192.168.1.10:4533)"
+msgstr ""
+
+msgid "Username"
+msgstr ""
+
+msgid "Password"
+msgstr ""
+
+msgid "Enter the address first"
+msgstr ""
+
+msgid "Connect to Wi-Fi first"
+msgstr ""
+
+msgid "Testing…"
+msgstr ""
+
+msgid "Server saved"
+msgstr ""
+
+msgid "Server removed"
+msgstr ""
+
+msgid "Edit server"
+msgstr ""
+
+msgid "Not set"
+msgstr ""
+
+msgid "Address"
+msgstr ""
+
+msgid "Verify HTTPS certificate"
+msgstr ""
+
+msgid "  Connected"
+msgstr ""
+
+msgid "Test"
+msgstr ""
+
+msgid "Sure?"
+msgstr ""
+
+msgid "Not audio"
+msgstr ""
+
+msgid "can't stream"
+msgstr ""
+
+msgid "Still connecting…"
+msgstr ""
+
+msgid "Folders are nested too deep"
+msgstr ""
+
+msgid "Folder"
+msgstr ""
+
+msgid "Nothing here can be streamed"
+msgstr ""
+
+msgid "This format can't be streamed"
+msgstr ""
+
+msgid "Couldn't load this folder"
+msgstr ""
+
+msgid "This folder is empty"
+msgstr ""
+
+#, c-format
+msgid "%d track%s%s"
+msgstr ""
+
+#, c-format
+msgid "%d tracks%s%s"
+msgstr ""
+
+#, c-format
+msgid "Show more (%d left)"
+msgstr ""
+
+msgid "Couldn't reach the server"
+msgstr ""
+
+msgid "This server shares no music folders"
+msgstr ""
+
+msgid "DLNA · Connecting…"
+msgstr ""
+
+msgid "DLNA · Online"
+msgstr ""
+
+msgid "Offline"
+msgstr ""
+
+#, c-format
+msgid "Added %s"
+msgstr ""
+
+msgid "Checking the address…"
+msgstr ""
+
+msgid "Server IP address"
+msgstr ""
+
+msgid "Searching your network…"
+msgstr ""
+
+msgid "Tap a server to add it."
+msgstr ""
+
+msgid "No media servers answered."
+msgstr ""
+
+msgid "Added"
+msgstr ""
+
+msgid "Enter address instead"
+msgstr ""
+
+msgid "DLNA servers"
+msgstr ""
+
+msgid "What kind of server?"
+msgstr ""
+
+msgid "Subsonic server"
+msgstr ""
+
+msgid "Navidrome, Gonic, Airsonic. Login, search, random mix."
+msgstr ""
+
+msgid "DLNA media server"
+msgstr ""
+
+msgid ""
+"Built into most NAS boxes, Jellyfin, Plex. Found automatically, no login, "
+"home network only."
+msgstr ""
+
+msgid ""
+"Not sure? If your NAS has \"Media Server\" or \"DLNA\" turned on, pick DLNA."
+msgstr ""
+
+msgid "Description address"
+msgstr ""
+
+msgid "Could not connect"
+msgstr ""
+
+msgid "Online"
+msgstr ""
+
+msgid "No songs"
+msgstr ""
+
+msgid "Downloading"
+msgstr ""
+
+msgid "Not enough memory to start download"
+msgstr ""
+
+msgid "Invalid download folder"
+msgstr ""
+
+msgid "Download failed"
+msgstr ""
+
+#, c-format
+msgid "Stream quality: %s"
+msgstr ""
+
+msgid "Stream Quality"
+msgstr ""
+
+msgid "Applies to new streaming queues"
+msgstr ""
+
+msgid "Low (96 kbps)"
+msgstr ""
+
+msgid "Medium (192 kbps)"
+msgstr ""
+
+msgid "High (320 kbps)"
+msgstr ""
+
+#, c-format
+msgid "Download folder: %s"
+msgstr ""
+
+msgid "Download folder: SD root"
+msgstr ""
+
+msgid "Invalid download folder name"
+msgstr ""
+
+msgid "Download subfolder"
+msgstr ""
+
+msgid "Download Settings"
+msgstr ""
+
+msgid "Subfolder: SD root"
+msgstr ""
+
+msgid ""
+"Subfolder is relative to SD root (example: Music/Offline); empty uses SD root"
+msgstr ""
+
+msgid "Folder layout for downloaded albums"
+msgstr ""
+
+msgid "Album Artist / Album"
+msgstr ""
+
+msgid "Album Artist - Album"
+msgstr ""
+
+msgid "Failed to load from server"
+msgstr ""
+
+msgid "Not enough memory to load from server"
+msgstr ""
+
+msgid "Loading from server..."
+msgstr ""
+
+msgid "Server request timed out after 30 seconds"
+msgstr ""
+
+msgid "Not enough memory to load artists"
+msgstr ""
+
+#, c-format
+msgid ""
+"Downloading\n"
+"%s..."
+msgstr ""
+
+#, c-format
+msgid "Download \"%s\"?"
+msgstr ""
+
+#, c-format
+msgid "Download every album from \"%s\"?"
+msgstr ""
+
+msgid "Download"
+msgstr ""
+
+msgid "Failed to load artists"
+msgstr ""
+
+msgid "Failed to connect to server"
+msgstr ""
+
+msgid "Connection timed out after 30 seconds"
+msgstr ""
+
+#, c-format
+msgid "Failed to load artists: %s"
+msgstr ""
+
+msgid "Not enough memory to connect"
+msgstr ""
+
+msgid "Connecting to server..."
+msgstr ""
+
+msgid "Failed to start connection"
+msgstr ""
+
+msgid "No saved servers"
+msgstr ""
+
+msgid "Go back and choose New Connection to add one."
+msgstr ""
+
+msgid "Saved Servers"
+msgstr ""
+
+#, c-format
+msgid "Server URL (e.g. %s)"
+msgstr ""
+
+#, c-format
+msgid "Server URL: %s"
+msgstr ""
+
+msgid "Verify server certificate"
+msgstr ""
+
+#, c-format
+msgid "Username: %s"
+msgstr ""
+
+msgid "Password: Set"
+msgstr ""
+
+msgid "Password: Not set"
+msgstr ""
+
+msgid "Connect & Browse"
+msgstr ""
+
+msgid "New Connection"
+msgstr ""
+
+msgid "Download settings"
+msgstr ""
+
+msgid "Charge only"
+msgstr ""
+
+msgid "Storage"
+msgstr ""
+
+msgid "USB DAC"
+msgstr ""
+
+msgid "Turn off ADB in Developer Options to use these modes"
+msgstr ""
+
+msgid "Connect to a computer to choose a USB mode"
+msgstr ""
+
+msgid "Could not start USB mode switch"
+msgstr ""
+
+msgid "USB mode"
+msgstr ""
+
+#, c-format
+msgid "Failed to switch to %s"
+msgstr ""
+
+msgid "Eject the card on the computer before unplugging, or tap Disconnect."
+msgstr ""
+
+msgid "Getting the card back…"
+msgstr ""
+
+msgid "Preparing USB storage…"
+msgstr ""
+
+#, c-format
+msgid "Card in use by %s; can't lend it now"
+msgstr ""
+
+msgid "Could not connect as USB storage"
+msgstr ""
+
+msgid "Connected as USB storage"
+msgstr ""
+
+msgid "Disconnect"
+msgstr ""
+
+msgid "Connected to a computer"
+msgstr ""
+
+msgid "Leave USB DAC mode?"
+msgstr ""
+
+msgid "USB DAC mode"
+msgstr ""
+
+msgid "Waiting for USB audio…"
+msgstr ""
+
+msgid "This device is now a USB sound card"
+msgstr ""
+
+#, c-format
+msgid "USB input: native %s"
+msgstr ""
+
+#, c-format
+msgid "USB input: %s · %u-bit"
+msgstr ""
+
+msgid "DAC path: this DSD rate is not supported"
+msgstr ""
+
+#, c-format
+msgid "DAC path: DSD over PCM (DoP) · %s"
+msgstr ""
+
+#, c-format
+msgid "DAC path: %s · %u-bit"
+msgstr ""
+
+msgid "Wrong Wi-Fi password"
+msgstr ""
+
+msgid "Wi-Fi network not in range"
+msgstr ""
+
+msgid "Couldn't connect to Wi-Fi network"
+msgstr ""
+
+msgid "Wi-Fi is busy"
+msgstr ""
+
+msgid "Connecting to"
+msgstr ""
+
+msgid "Wi-Fi password must be 8 to 63 characters or 64 hex digits"
+msgstr ""
+
+msgid "Wi-Fi Password"
+msgstr ""
+
+msgid "Secured · Connected"
+msgstr ""
+
+msgid "Open · Connected"
+msgstr ""
+
+msgid "Saved network"
+msgstr ""
+
+msgid "Secured network"
+msgstr ""
+
+msgid "Open network"
+msgstr ""
+
+msgid "Wi-Fi could not be enabled"
+msgstr ""
+
+msgid "Check the wireless switch and try again."
+msgstr ""
+
+msgid "Turning Wi-Fi on"
+msgstr ""
+
+msgid "Nearby networks will appear when Wi-Fi is ready."
+msgstr ""
+
+msgid "Searching for networks"
+msgstr ""
+
+msgid "This can take a few seconds."
+msgstr ""
+
+msgid "No networks found"
+msgstr ""
+
+msgid "Try scanning again or add a hidden network."
+msgstr ""
+
+msgid "SSID must be 1 to 32 bytes"
+msgstr ""
+
+msgid "Wi-Fi is still starting"
+msgstr ""
+
+msgid "Network Name (SSID)"
+msgstr ""
+
+msgid "Loading..."
+msgstr ""
+
+msgid "Not connected"
+msgstr ""
+
+msgid "Weak"
+msgstr ""
+
+msgid "Fair"
+msgstr ""
+
+msgid "Good"
+msgstr ""
+
+msgid "Excellent"
+msgstr ""
+
+#, c-format
+msgid "SSID: %s"
+msgstr ""
+
+#, c-format
+msgid "IP Address: %s"
+msgstr ""
+
+#, c-format
+msgid "Gateway: %s"
+msgstr ""
+
+#, c-format
+msgid "MAC Address: %s"
+msgstr ""
+
+#, c-format
+msgid "Signal: %s"
+msgstr ""
+
+msgid "Wi-Fi Info"
+msgstr ""
+
+msgid "Primary DNS"
+msgstr ""
+
+msgid "Secondary DNS"
+msgstr ""
+
+msgid "Enter an IPv4 address, such as 1.1.1.1"
+msgstr ""
+
+msgid "DNS Settings"
+msgstr ""
+
+msgid "Manual SSID Entry"
+msgstr ""
+
+msgid "Memorized Networks"
+msgstr ""
+
+msgid "No memorized networks"
+msgstr ""
+
+msgid "Networks you connect to will appear here."
+msgstr ""
+
+msgid "Loading Wi-Fi settings"
+msgstr ""
+
+msgid "Saved network details are being checked."
+msgstr ""
+
+msgid "Available Networks"
+msgstr ""
+
+msgid "Scanning for networks"
+msgstr ""
+
+msgid "Nearby Wi-Fi networks will appear here."
+msgstr ""
+
+msgid "Check that Wi-Fi is enabled, then rescan."
+msgstr ""
+
+msgid "Enable WiFi to access"
+msgstr ""
+
+msgid "Open this address on your phone or computer:"
+msgstr ""
+
+msgid ""
+"Closing\n"
+"Web Server..."
+msgstr ""
+
+msgid "Import via Wi-Fi"
+msgstr ""
+
+msgid "Web Server is busy"
+msgstr ""
+
+msgid "No items"
+msgstr ""
+
+msgid "Unable to load items"
+msgstr ""
+
+msgid "There are no entries in this view."
+msgstr ""
+
+msgid "Your library is being loaded."
+msgstr ""
+
+msgid "Leave this view and try again."
+msgstr ""
+
+msgid "Power off"
+msgstr ""
+
+msgid "Screen off"
+msgstr ""
+
+msgid "Sleep timer"
+msgstr ""
+
+msgid "Power controls"
+msgstr ""
+
+msgid "Playback and device actions"
+msgstr ""

@@ -1,0 +1,13 @@
+Stream Media icons
+
+Drawn from plain geometry by tools/assets/generate_stream_media_icons.py (no
+source images, no third-party marks):
+
+subsonic_row.png and subsonic_row_s.png
+  192x192 RGBA. A generic media-server stack (three server units with
+  status lights) with a beamed note pair. The selected file repeats the
+  normal artwork; the UI provides the pressed/selected row highlight.
+
+download.png
+  34x34 RGBA, white. A down arrow into an open tray; the app tints it with
+  the accent color.

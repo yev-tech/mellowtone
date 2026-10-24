@@ -1,0 +1,5617 @@
+#include "board_config.h"
+#include "board.h"
+#include "mt_features.h"
+#include "storage_paths.h"
+#include "plugin_manager.h"
+#include "wifi_status.h"
+#include <sys/statvfs.h>
+#include "i18n.h"
+#include "gui.h"
+#include "gui_player.h"
+#include "gui_reload.h"
+#include "peq.h"
+#include "led_control.h"
+#include "battery.h"
+#include "charge_control.h"
+#include "audio.h"
+#include "http_client.h"
+#include "playlist_files.h"
+#include "plugin_json.h"
+#include "plugin_storage.h"
+#include "radio_list.h"
+#include "plugin_internal.h"
+#include "plugin_disabled_list.h"
+#include "db_log.h"
+#include "app_version.h"
+#include "fallback_font.h"
+#include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
+#include "image_thumb.h"
+#include "gui_text_view.h"
+
+#include "lua.h"
+#include "lauxlib.h"
+#include "lualib.h"
+
+#include <ctype.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <string.h>
+#include <strings.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <limits.h>
+#include <unistd.h>
+#include <setjmp.h>
+
+#ifdef HOST_BUILD
+  #define MUSIC_ROOT_DIR "./music"
+#else
+  /* SD card mount point -- see gui.c's own MUSIC_ROOT_DIR comment; each
+   * file that needs it defines its own copy rather than sharing a header,
+   * matching gui.c/remote_control.c/metadata_db.c already doing the same. */
+  #define MUSIC_ROOT_DIR BOARD_SD_ROOT ""
+
+  /* Same override root assets.c's own asset_path() checks (see its own
+   * comment there) -- duplicated here rather than shared via a header,
+   * same convention as MUSIC_ROOT_DIR above. Only defined on target:
+   * asset_path() never checks any override root on HOST_BUILD, so
+   * plugin.set_icon() is a no-op there (see its own comment below) rather
+   * than writing files nothing would ever read. */
+  #define PLUGIN_THEME_OVERRIDE_ROOT BOARD_DATA_ROOT "/theme_overrides/"
+#endif
+
+/* Same "each file defines its own derived-path macro" convention as
+ * MUSIC_ROOT_DIR above -- matches gui.c's own PLAYLISTS_DIR exactly. */
+#define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
+
+/* Concurrently loaded plugins. Each keeps its own lua_State for the whole
+ * session and runs its top-level code at boot, so this bounds resident
+ * memory and startup time; enabled files past it are reported as over the
+ * limit in Plugin Manager instead of being skipped silently. */
+#define PLUGIN_MAX_FILES 32
+#define PLUGIN_MAX_LIST_ITEMS 500
+#define PLUGIN_MAX_ASYNC_HTTP 4
+#define PLUGIN_ASYNC_HTTP_DEFAULT_MAX (512U * 1024U)
+#define PLUGIN_ASYNC_HTTP_MAX_RESPONSE (2U * 1024U * 1024U)
+#define PLUGIN_ASYNC_HTTP_MAX_REQUEST (1024U * 1024U)
+
+typedef struct {
+    lua_State * L;
+    int open_ref; /* LUA_REGISTRYINDEX ref to the on_open function */
+    char label[64];
+    char icon[96];
+    char icon_selected[96];
+} plugin_tile_t;
+
+/* Leaner sibling of plugin_tile_t for plugin.register_list_item() -- pill-
+ * list rows (screen_builders.h's pill_list_item_t) now DO have an icon/
+ * height/width/text_size slot (this session's row-layout work),
+ * populated from this call's optional 4th `options` table -- see
+ * append_list_item()'s own comment. Empty string ("") means "unset" for
+ * icon_path/text_size, matching pill_list_item_t's own NULL convention one
+ * level up (plugin_manager_get_*_list_item_options() below translates
+ * empty-string back to NULL for its callers). */
+typedef struct {
+    lua_State * L;
+    int open_ref;
+    char label[64];
+    char icon_path[256];
+    char group[33];
+    int32_t row_height;
+    int32_t row_width;
+    char text_size[8];
+} plugin_list_item_t;
+
+typedef struct {
+    lua_State * L;
+    char id[64];
+    char name[96];
+    char version[32];
+    bool defined;
+    /* Set when a plugin call blew past the hard time budget and was
+     * longjmp-aborted (see plugin_call()). Its lua_State is then left frozen
+     * mid-execution and must never be run again. */
+    bool aborted;
+    time_t last_library_refresh;
+    /* Source filename (basename, e.g. "Theme.lua"), not just the derived
+     * plugin id -- needed by plugin_manager_scan_available() to map a
+     * loaded instance back to the file it came from even when the plugin
+     * declared its own custom plugin.define() id rather than falling back
+     * to the "legacy.<filename>" id below. */
+    char filename[256];
+} plugin_instance_t;
+
+static plugin_instance_t plugin_instances[PLUGIN_MAX_FILES];
+static int plugin_instance_count = 0;
+/* Enabled files the last init left unloaded because PLUGIN_MAX_FILES was
+ * reached, kept as filename hashes for plugin_manager_scan_available(). */
+#define PLUGIN_OVER_LIMIT_MAX 64
+static uint64_t plugin_over_limit[PLUGIN_OVER_LIMIT_MAX];
+static int plugin_over_limit_count = 0;
+
+static uint64_t plugin_filename_hash(const char * name) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (const unsigned char * p = (const unsigned char *) name; *p; p++) h = (h ^ *p) * UINT64_C(1099511628211);
+    return h;
+}
+static int loading_plugin_slot = -1;
+static lua_State * plugin_led_override_owner = NULL;
+
+/* plugin.storage and plugin.secrets need to know WHICH plugin is calling
+ * at arbitrary runtime (not just at plugin.define() time, unlike
+ * loading_plugin_slot above) -- each plugin owns exactly one lua_State for
+ * its whole lifetime (this file's own top comment), so a linear scan
+ * matching L is enough; PLUGIN_MAX_FILES is small and this only runs on
+ * an explicit plugin.storage/secrets call, not per frame. */
+static plugin_instance_t * plugin_instance_for_state(lua_State * L) {
+    for (int i = 0; i < PLUGIN_MAX_FILES; i++) {
+        if (plugin_instances[i].L == L) return &plugin_instances[i];
+    }
+    return NULL;
+}
+
+/* A call made from inside a plugin coroutine runs on that coroutine's own
+ * lua_State; the owner is always the plugin's main state so a release from
+ * any of its threads matches. */
+static lua_State * plugin_main_state(lua_State * L) {
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+    lua_State * main = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    return main ? main : L;
+}
+
+/* The one check before any Lua API access (push, rawgeti, unref,
+ * plugin_call) on a stored callback state. Every registry keeps the
+ * plugin's main state, so this finds its instance. A hard-aborted state is
+ * frozen mid-execution and its stack does not grow; a state of a plugin
+ * that failed to load is closed. Neither may be touched again. */
+static bool plugin_state_usable(lua_State * L) {
+    if (!L) return false;
+    plugin_instance_t * inst = plugin_instance_for_state(L);
+    return inst && !inst->aborted;
+}
+
+/* Returns charge-status control to the current user setting only when the
+ * plugin whose main Lua state is L owns the shared override. L must already
+ * be a main state: the error and failed-load paths pass one directly and
+ * never touch a possibly hard-aborted state's registry. */
+static void release_plugin_led_override(lua_State * L) {
+    if (plugin_led_override_owner != L) return;
+    plugin_led_override_owner = NULL;
+    led_control_clear_override();
+    led_control_apply(current_settings.led_indicator_enabled);
+}
+
+/* Shared by every plugin.storage and plugin.secrets binding below --
+ * requires plugin.define({id=...}) to have already run on this lua_State,
+ * matching plugin_storage.c's own expectation that plugin_id is a real,
+ * validated identity, not an empty/default string. */
+static const char * require_plugin_id(lua_State * L) {
+    plugin_instance_t * inst = plugin_instance_for_state(L);
+    if (!inst || !inst->defined || !inst->id[0]) {
+        luaL_error(L, "plugin.storage/secrets requires plugin.define({id=...}) to run first");
+        return NULL; /* unreachable -- luaL_error() longjmps */
+    }
+    return inst->id;
+}
+
+/* Review finding: sandbox_plugin_lua_state()'s io.open()/io.lines()/
+ * io.input()/io.output()/os.remove()/os.rename() wrappers (see that
+ * function's own comment) only cover Lua's OWN stdlib entry points into
+ * the filesystem. Several native plugin.* C functions accept a
+ * caller-controlled path and reach the filesystem directly -- mkdir(),
+ * fopen(), opendir(), a worker thread's own file creation -- entirely
+ * bypassing those wrappers, since they never go through Lua's io/os
+ * tables at all. This is the same reserved-tree check applied uniformly
+ * to every one of those native entry points below (list_dir, mkdir,
+ * play_file/play_list, set_icon's source path, eq_load/save_profile,
+ * download_file_async's destination). Raises a clean Lua error (rather
+ * than returning nil/empty) so a plugin author sees immediately that a
+ * reserved path was rejected, matching io.lines()/io.input()/io.output()'s
+ * own error convention above rather than inventing a different one per
+ * call site. Returns the checked path so callers can use it exactly like
+ * luaL_checkstring()'s result. */
+static const char * check_plugin_external_path(lua_State * L, int index, const char * api) {
+    const char * path = luaL_checkstring(L, index);
+    if (plugin_storage_path_is_reserved(path)) {
+        luaL_error(L, "%s: path is reserved (player settings, plugin.storage, plugin.secrets)", api);
+        return NULL; /* unreachable -- luaL_error() longjmps */
+    }
+    return path;
+}
+
+#define INSTALL_ROOT_READ_ONLY "the player's install directory is read-only for plugins"
+
+/* For paths a plugin writes: also never the install root (flash). */
+static const char * check_plugin_writable_path(lua_State * L, int index, const char * api) {
+    const char * path = check_plugin_external_path(L, index, api);
+    if (plugin_path_in_install_root(path)) {
+        luaL_error(L, "%s: " INSTALL_ROOT_READ_ONLY, api);
+        return NULL;
+    }
+    return path;
+}
+
+/* Registries for plugin.register_list_item(list_id, ...) -- native screens
+ * (settings, display, playback, music_audio, music_controls,
+ * music_timers, music_library, power, system, radio, developer) append their plugin rows
+ * after built-in items. Storage is organized into a shared 2D array indexed
+ * by target descriptor, while enforcing each target's individual max_items. */
+typedef enum {
+    PLUGIN_LIST_TARGET_SETTINGS = 0,
+    PLUGIN_LIST_TARGET_DISPLAY,
+    PLUGIN_LIST_TARGET_PLAYBACK,
+    PLUGIN_LIST_TARGET_MUSIC_AUDIO,
+    PLUGIN_LIST_TARGET_MUSIC_CONTROLS,
+    PLUGIN_LIST_TARGET_MUSIC_TIMERS,
+    PLUGIN_LIST_TARGET_MUSIC_LIBRARY,
+    PLUGIN_LIST_TARGET_POWER,
+    PLUGIN_LIST_TARGET_SYSTEM,
+    PLUGIN_LIST_TARGET_RADIO,
+    PLUGIN_LIST_TARGET_DEVELOPER,
+    PLUGIN_LIST_TARGET_COUNT
+} plugin_list_target_t;
+
+typedef struct {
+    const char * list_id;
+    const char * kind;
+    int max_items;
+} plugin_list_target_desc_t;
+
+static const plugin_list_target_desc_t plugin_list_targets[PLUGIN_LIST_TARGET_COUNT] = {
+    [PLUGIN_LIST_TARGET_SETTINGS] = { "settings", "settings list item", PLUGIN_MAX_SETTINGS_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_DISPLAY] = { "display", "display list item", PLUGIN_MAX_DISPLAY_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_PLAYBACK] = { "playback", "playback list item", PLUGIN_MAX_PLAYBACK_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_AUDIO] = { "music_audio", "music_audio list item", PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_CONTROLS] = { "music_controls", "music_controls list item", PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_TIMERS] = { "music_timers", "music_timers list item", PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_LIBRARY] = { "music_library", "music_library list item", PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_POWER] = { "power", "power list item", PLUGIN_MAX_POWER_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_SYSTEM] = { "system", "system list item", PLUGIN_MAX_SYSTEM_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_RADIO] = { "radio", "radio list item", PLUGIN_MAX_RADIO_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_DEVELOPER] = { "developer", "developer list item", PLUGIN_MAX_DEVELOPER_LIST_ITEMS },
+};
+
+/* Second dimension uses PLUGIN_MAX_SETTINGS_LIST_ITEMS as a stand-in for "the
+ * largest of the per-target maxes" -- true today since all of them are 8, but
+ * NOT automatically enforced: if any single PLUGIN_MAX_*_LIST_ITEMS above is
+ * ever raised past 8, this dimension must be raised to match, or that
+ * target's registration bounds check (which correctly checks its own
+ * max_items) would still accept writes this array can't physically hold. */
+static plugin_list_item_t plugin_list_items[PLUGIN_LIST_TARGET_COUNT][PLUGIN_MAX_SETTINGS_LIST_ITEMS];
+static int plugin_list_item_counts[PLUGIN_LIST_TARGET_COUNT];
+
+/* Separate registry for plugin.register_stream_media_tile() -- same
+ * plugin_tile_t shape, different surface (gui.c's Stream Media screen).
+ * See PLUGIN_MAX_STREAM_TILES's own comment in plugin_manager.h for why
+ * Stream Media gets real tiles when Home doesn't. */
+static plugin_tile_t plugin_stream_tiles[PLUGIN_MAX_STREAM_TILES];
+static int plugin_stream_tile_count = 0;
+
+/* Registry for plugin.register_quick_toggle() -- its own struct rather than
+ * plugin_tile_t because a quick toggle carries live state (value) and two
+ * state captions a tile has no concept of, and its Lua ref is an
+ * on_change(new_value) rather than a no-arg on_open. */
+typedef struct {
+    lua_State * L;
+    int change_ref; /* LUA_REGISTRYINDEX ref to the on_change function */
+    int on_hold_ref; /* optional LUA_REGISTRYINDEX ref to settings-opening callback */
+    char id[40];
+    char label[64];
+    char icon[96];
+    char icon_selected[96];
+    char on_text[16];
+    char off_text[16];
+    bool value;
+} plugin_quick_toggle_t;
+
+static plugin_quick_toggle_t plugin_quick_toggles[PLUGIN_MAX_QUICK_TOGGLES];
+static int plugin_quick_toggle_count = 0;
+
+/* Each reusable plugin.show_list() screen owns its on_select callback. This
+ * matters after Back returns from a nested list: the older screen must route
+ * through its original callback, not whichever list was opened most recently. */
+typedef struct {
+    lua_State * L;
+    int select_ref;
+    lua_Integer handle; /* show_list()'s return value for the list now in this slot */
+} plugin_list_callback_t;
+
+static plugin_list_callback_t plugin_list_callbacks[PLUGIN_LIST_SCREEN_POOL_SIZE];
+static lua_Integer plugin_list_next_handle = 1;
+
+/* Per-(pool slot, row) Lua callback ref storage for plugin.show_settings_list()
+ * -- a settings-list screen carries per-row toggle/slider state that
+ * needs to survive being navigated away from and back to, so storage is
+ * keyed by the actual gui.c pool slot instead of "whichever call was most
+ * recent". L is NULL for a row that's never been populated (both the
+ * static-array initial state, and after being unref'd when its slot is
+ * reused for a shorter call) -- used as l_plugin_show_settings_list()'s own
+ * guard for "does this row need unref'ing before I overwrite it". */
+typedef struct {
+    lua_State * L;
+    int callback_ref; /* on_select for a "row" row, on_change for "toggle"/"slider" */
+} plugin_settings_list_row_ref_t;
+
+static plugin_settings_list_row_ref_t
+    plugin_settings_list_rows[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE][PLUGIN_SETTINGS_LIST_MAX_ROWS];
+static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE];
+
+/* ---- plugin.* C API, exposed as a global table `plugin` in every loaded
+ * script's own lua_State (see register_plugin_api() below):
+ *
+ *   plugin.register_list_item(list_id, label, on_open)
+ *     Adds a row labeled `label` to an existing native list screen,
+ *     identified by `list_id`: one of the 11 lists in plugin_manager.h
+ *     (PLUGIN_MAX_*_LIST_ITEMS, which also lists where each appears).
+ *     Every plugin that calls this gets its own row; tapping it calls
+ *     on_open() with no arguments.
+ *
+ *     Optional 4th arg `options`: { icon, height, width, text_size, group }
+ *     -- icon is an absolute path or one relative to the plugins folder;
+ *     height and width (px) are clamped (PILL_ROW_HEIGHT_MIN/MAX,
+ *     PILL_ROW_WIDTH_MIN/MAX in screen_builders.h); text_size picks the
+ *     row's font; group places the row in a submenu of "display" or
+ *     "music_audio". All default to the list's own look -- see
+ *     docs/PLUGINS.md for the full picture.
+ *
+ *   plugin.show_list(title, items, on_select [, options])
+ *     Opens a list screen titled `title`. Each `items` entry is either a
+ *     plain string (a row with just a label) or a table { label = "...",
+ *     icon = "...", text_size = "..." } for a row with its own icon/text
+ *     size (same `icon`/`text_size` meaning as register_list_item()'s
+ *     `options` above). on_select(index): called with the 1-based Lua index
+ *     of the tapped row. Optional 4th arg `options`: { height = n,
+ *     selected = n } --
+ *     applies to every row in this call (not per-row).
+ *
+ *   plugin.show_settings_list(title, items)
+ *     Opens a nested settings submenu titled `title`, indistinguishable
+ *     from a native Settings screen -- unlike show_list() above, each row
+ *     carries a real accessory and its own callback rather than one shared
+ *     on_select(index). Each entry in `items` is a table: { type = "row",
+ *     label = "...", on_select = function() ... end } for a plain tap (an
+ *     on_select that itself calls show_settings_list() again is how a
+ *     submenu nests inside a submenu); { type = "toggle", label = "...",
+ *     value = true/false, on_change = function(new_value) ... end } for an
+ *     on/off switch; or { type = "slider", label = "...", min = n, max = n,
+ *     value = n, on_change = function(new_value) ... end } for a slider --
+ *     on_change fires once when the drag is released, not on every
+ *     intermediate tick. Every row type also accepts `icon`/`text_size`
+ *     (same meaning as register_list_item()'s `options` above); `height`
+ *     too, except for a "slider" row (its own fixed-layout card has no
+ *     spare room to grow into). Capped at 24 rows and 4 slider rows per
+ *     call, silently truncated past that (same convention as show_list()'s
+ *     own item cap) -- an unknown/missing `type`, an unrecognized
+ *     `text_size`, or a row missing its required callback, all raise a Lua
+ *     error instead.
+ *
+ *   plugin.list_dir(path)
+ *     Returns an array table of { name = "...", dir = true/false } for
+ *     each non-hidden entry directly under the absolute path `path`.
+ *
+ *   plugin.sd_root()
+ *     Returns the SD card's absolute mount path, so a script can build
+ *     paths under it (e.g. plugin.sd_root() .. "/Podcasts").
+ *
+ *   plugin.playlist_list() -> { m3u_path, ... } | nil
+ *   plugin.playlist_read(m3u_path) -> { song_path, ... } | nil
+ *   plugin.playlist_create(name, song_path) -> m3u_path | nil
+ *   plugin.playlist_add(m3u_path, song_path) -> bool
+ *   plugin.playlist_remove(m3u_path, song_path) -> bool
+ *   plugin.playlist_delete(m3u_path) -> bool
+ *     CRUD over .m3u playlists under the same Playlists folder the native
+ *     Playlists screen uses. create()/delete() also update the app's
+ *     playlist-existence cache, so the result shows up/disappears there
+ *     immediately rather than needing a full library rescan.
+ *
+ *   plugin.play_file(path)
+ *     Plays a single file as a fresh one-song playlist.
+ *
+ *   plugin.play_list(paths [, start_index])
+ *     Plays `paths` (an array table of file paths) as a fresh playlist,
+ *     starting at the 1-based `start_index` (default 1).
+ *
+ *   plugin.show_toast(message [, duration_ms])
+ *     Shows the same transient toast used elsewhere in the app; duration
+ *     defaults to 5000ms and is clamped by validation to 100..30000ms.
+ *
+ *   plugin.led_available() -> bool
+ *     True when both charge-status LED brightness sysfs nodes exist on this
+ *     board.
+ *
+ *   plugin.led_set(color, on_or_level)
+ *     Sets one color to off, full brightness (true), or integer brightness
+ *     0..100. Setting a color stops its current effect.
+ *
+ *   plugin.led_blink(color, on_ms, off_ms [, level])
+ *     Software blink using a UI-thread LVGL timer. Each interval is clamped
+ *     to 50..60000ms; level defaults to 100 and is clamped to 0..100.
+ *
+ *   plugin.led_breathe(color, period_ms_or_bpm [, level])
+ *     Red at peak level 100 uses the kernel breathing trigger. Other colors
+ *     and partial peaks use software stepping at 25Hz or less. Numeric
+ *     periods 1..600 mean breaths per minute; values above 600 mean period
+ *     milliseconds. Leaving kernel breathing restores trigger=none.
+ *
+ *   plugin.led_get(color) -> { mode, level }
+ *     Reports off/on/blink/breathe/status and the configured level or peak;
+ *     status mode reports the current normal-indicator brightness.
+ *
+ *   plugin.led_status([color])
+ *     Returns one color, or both when omitted/nil, to charge-status mode.
+ *     The other color keeps its plugin mode.
+ *
+ *   plugin.led_release()
+ *     Only the most recent plugin to control an LED owns the shared override.
+ *     Releasing restores charge-status indication when LED Indicator is
+ *     enabled, or turns both LEDs off otherwise. Errors and plugin/UI reloads
+ *     also release the owner. These synchronous calls run on the main UI
+ *     thread.
+ *
+ *   plugin.register_stream_media_tile(label, on_open [, icon])
+ *     Appended as a real icon-grid tile in gui.c's Stream Media screen
+ *     (after the built-in Subsonic tile) -- for plugins that thematically
+ *     belong there (a Net Radio source, or similar) rather than in a
+ *     list. Up to PLUGIN_MAX_STREAM_TILES (plugin_manager.h) across
+ *     all loaded plugins combined. icon defaults to stream_media/radio.png
+ *     if omitted.
+ *
+ *   plugin.set_icon(theme_relative_path, source_file_path)
+ *     Reskins an EXISTING icon in place (e.g. "launcher/music.png" for
+ *     Home's Music shortcut) by copying source_file_path's bytes into the
+ *     app's writable theme-override directory. Top-level calls take effect
+ *     during startup; a callback can call plugin.refresh_theme() after its
+ *     copies to refresh decoded images safely.
+ *
+ *   plugin.set_background_color(slot, rgb)
+ *     Sets one of three background-color slots app-wide, live, no restart
+ *     needed: "screen", "card", or "list_row" -- see
+ *     l_plugin_set_background_color()'s own comment for exactly what each
+ *     covers. rgb is a packed 0xRRGGBB integer, e.g. 0x1E1E22.
+ *
+ *   plugin.set_text_color(slot, rgb)
+ *     Sets one of two text-color slots app-wide, live, no restart needed --
+ *     "primary" (dominant near-white text) or "muted" (secondary/disabled-
+ *     ish gray text). Destructive-red and accent-tinted text are not
+ *     covered -- see l_plugin_set_text_color()'s own comment.
+ *
+ *   plugin.refresh_theme()
+ *     Drops decoded image caches, rebuilds Home, and refreshes transition
+ *     snapshots after the callback returns. Other screens, plugins, and
+ *     connection-owning services stay alive.
+ *
+ *   plugin.reload_ui()
+ *     Rebuilds every screen/style in the same process -- see gui_reload.h/.c
+ *     for the exact scope. This is what actually removes the "next app
+ *     start only" constraint plugin.set_icon() above
+ *     otherwise carry -- call it after one of those and the change is
+ *     visible immediately with no restart. Never touches audio playback or
+ *     any network/Bluetooth/D-Bus connection.
+ *
+ *     ONLY call this from a callback that fires in response to an actual
+ *     user action (e.g. an on_select handler when the user changes a
+ *     theme) -- NEVER unconditionally from a plugin's own top-level script
+ *     code. The reload re-runs every plugin's top-level code as part of
+ *     its own rebuild (plugin_manager_init(), same as a real boot); an
+ *     unconditional top-level call there is a request made WHILE that same
+ *     reload is still running, which gui_reload_request()'s reload_in_
+ *     progress guard (gui_reload.c) drops outright rather than queuing --
+ *     so this doesn't loop, but it does still cost one wasted extra reload
+ *     the very first time that plugin ever loads (real boot, or the next
+ *     reload after installing/updating it), for no reason. Calling this
+ *     conditionally, only when something actually changed, is still the
+ *     correct thing to do -- the guard exists to keep a mistake here cheap,
+ *     not to make the mistake free.
+ *
+ *   plugin.eq_load_profile(path) -> bool
+ *     Loads and applies a .peq profile file (src/audio/peq.c's own
+ *     save/load format) from an arbitrary path, then persists it as the
+ *     new always-current EQ state. Returns false (not a Lua error) if path
+ *     doesn't exist or isn't readable.
+ *
+ *   plugin.eq_save_profile(path) -> bool
+ *     Saves the current EQ state (bypass, preamp, all 10 bands) to path in
+ *     the same format. Returns false on write failure.
+ *
+ *   plugin.eq_reset()
+ *     Restores every band, the preamp, and bypass to peq.c's own built-in
+ *     defaults (same as the native EQ screen's Reset button).
+ *
+ *   plugin.eq_set_bypass(enabled)
+ *   plugin.eq_set_preamp(db)
+ *     Toggles/sets the whole-EQ bypass and pre-amp (dB).
+ *
+ *   plugin.eq_set_band(index, freq_hz, gain_db, q)
+ *   plugin.eq_set_band_type(index, type)
+ *   plugin.eq_set_band_enabled(index, enabled)
+ *     Per-band controls. index is 1-based (1..10, matching every other
+ *     1-based index in this API). type is "peaking", "low_shelf", or
+ *     "high_shelf".
+ *
+ *   plugin.toggle_pause()
+ *   plugin.stop()
+ *   plugin.next_track()
+ *   plugin.prev_track()
+ *   plugin.seek(seconds)
+ *   plugin.set_volume(percent)
+ *   plugin.is_playing() -> bool
+ *   plugin.is_paused() -> bool
+ *   plugin.get_position() -> seconds
+ *   plugin.get_duration() -> seconds
+ *   plugin.get_volume() -> 0..100
+ *   plugin.get_battery() -> { level, charging, full, external_power }
+ *     Playback control/query, bridged through gui.c so a plugin-driven
+ *     change stays in sync with the play/pause icon, volume slider/popup,
+ *     and shuffle-aware next/prev stepping the native UI itself uses -- see
+ *     gui.h's own comment on gui_plugin_toggle_pause() and neighbors.
+ *     percent is 0..100, clamped.
+ *
+ *   plugin.http_get(url [, verify_tls]) -> status, body
+ *     Synchronous GET request (src/network/http/http_client.c). verify_tls
+ *     defaults to true. Runs on the calling thread -- i.e. whatever plugin
+ *     callback invoked it, always the main UI thread -- so a slow/hanging
+ *     server blocks the UI until the request completes; keep calls fast or
+ *     user-initiated. Returns nil, "network error" on a DNS/connect/TLS
+ *     failure; a real HTTP error status (404, 500, ...) still returns
+ *     normally with that status and whatever body the server sent.
+ *
+ *   plugin.http_post(url, body [, content_type] [, verify_tls]) -> status, body
+ *     Same contract/blocking caveat as http_get() above, for a POST.
+ *     content_type defaults to "application/x-www-form-urlencoded" if
+ *     omitted/nil.
+ *
+ *   plugin.md5(text) -> lowercase hex string
+ *     MD5 of text -- for API signing schemes that need it (e.g. Last.fm's
+ *     own api_sig).
+ *
+ *   plugin.show_text_input(title, initial_text, is_password, on_submit)
+ *     Opens the app's own T9 keypad text-entry screen. on_submit(text) fires
+ *     only on an actual submit (T9 Enter) -- backing out via the screen's
+ *     own back button never calls it at all. This is a true SINGLETON
+ *     screen (same one Wi-Fi password entry/Subsonic login use): calling it
+ *     again before a pending call resolves silently replaces the pending
+ *     callback -- fine for one plugin chaining calls (ask username, then
+ *     password), not safe against two unrelated calls racing.
+ *
+ *   plugin.get_now_playing() -> title, artist, album, duration_seconds, or a
+ *   single nil if nothing is loaded
+ *     Pull accessor for whatever's currently loaded -- same metadata a
+ *     "track_started" event handler already receives as arguments, for code
+ *     that isn't reacting to that event directly.
+ *
+ *   plugin.on(event, callback)
+ *     Subscribes to a playback or device-state event -- every subscriber
+ *     fires across every loaded plugin (unlike register_list_item(), an event
+ *     isn't UI real estate to divide up). Playback, device, volume, and
+ *     battery events are documented in docs/PLUGINS.md:
+ *       "track_started" -- callback(title, artist, album, duration_seconds),
+ *         fires whenever a new track begins playing, whatever the cause
+ *         (manual tap, next/prev, gapless/crossfade auto-advance, a
+ *         plugin's own play_file/play_list, remote control).
+ *       "paused" / "resumed" -- callback(), no arguments.
+ *       "volume_changed" -- callback(percent), coalesced to the 500ms UI
+ *         tick and fired only when the applied volume percent changes.
+ *       "battery_changed" -- callback(info), when level/charging/full/
+ *         external_power changes.
+ *       "suspending" / "system_resumed" -- callback(), around suspend-to-RAM.
+ *         system_resumed is separate from playback's existing "resumed".
+ *       "stopped" -- callback(), no arguments, fires when playback stops
+ *         outright (not paused). Does NOT cover "playlist reaches its end
+ *         with repeat off" (that path doesn't route through this app's own
+ *         explicit stop call sites) -- a known, documented gap, not
+ *         something every plugin needs.
+ *     Unknown event name raises a Lua error immediately, same convention as
+ *     an unknown list_id.
+ *
+ *   plugin.set_interval(seconds, callback) -> handle
+ *   plugin.clear_interval(handle)
+ *     Generic repeating timer (LVGL-backed, same mechanism this app's own
+ *     500ms UI polling loop uses) -- e.g. for periodically checking
+ *     get_position() against some threshold. seconds is clamped up to a
+ *     1-second minimum if lower, silently (not an error). Errors if more
+ *     than PLUGIN_MAX_INTERVALS (plugin_manager.h) are active at once,
+ *     across every loaded plugin combined. A callback registered this way
+ *     runs on the main UI thread exactly like every other plugin callback --
+ *     a slow http_get()/http_post() inside one will visibly stall the UI
+ *     until it returns, same tradeoff http_get() itself already documents.
+ * ---- */
+
+/* Used by l_plugin_register_stream_media_tile() -- fills t->icon/icon_selected
+ * from an explicit icon string (deriving the "_s" selected-state variant
+ * the same way every real icon pair in this app is named), or from
+ * (default_icon, default_icon_selected) if icon is NULL. */
+static void fill_tile_icon(plugin_tile_t * t, const char * icon, const char * default_icon,
+                            const char * default_icon_selected) {
+    if (icon) {
+        char base[80];
+        snprintf(base, sizeof(base), "%s", icon);
+        char * dot = strrchr(base, '.');
+        if (dot) *dot = '\0';
+        snprintf(t->icon, sizeof(t->icon), "%s", icon);
+        snprintf(t->icon_selected, sizeof(t->icon_selected), "%s_s.png", base);
+    } else {
+        snprintf(t->icon, sizeof(t->icon), "%s", default_icon);
+        snprintf(t->icon_selected, sizeof(t->icon_selected), "%s", default_icon_selected);
+    }
+}
+
+/* Validates a text_size string against the four recognized tiers -- shared
+ * by append_list_item() below, l_plugin_show_settings_list()/
+ * l_plugin_show_list(), and l_plugin_set_launcher_layout() (fail loudly at the
+ * Lua boundary, same convention every other unrecognized-string case in this
+ * file already uses; the resolved font itself is picked later, in
+ * screen_builders.c's pill_row_resolve_text_size(), which trusts this was
+ * already validated). "mono" (lv_font_unscii_16, ASCII-only -- see
+ * pill_row_resolve_text_size()'s own comment) is available to every plugin
+ * row this validates. */
+static bool is_valid_text_size(const char * text_size) {
+    return strcmp(text_size, "small") == 0 || strcmp(text_size, "medium") == 0 || strcmp(text_size, "large") == 0 ||
+           strcmp(text_size, "mono") == 0;
+}
+
+/* Shared by l_plugin_register_list_item() below, once its capacity check
+ * for the target array has already passed -- pushes on_open (Lua stack
+ * index 3 in the caller) into the registry and appends {L, ref, label}, plus
+ * this call's optional 4th `options` table ({ icon, height, width, text_size },
+ * docs/PLUGINS.md) if present. icon_path/text_size are left as empty strings
+ * (not touched at all here, matching the struct's already-zero-initialized
+ * static-array storage) when `options` is absent or doesn't set that field
+ * -- plugin_manager_get_*_list_item_options() below is what translates that
+ * back to NULL for its own callers. */
+static void append_list_item(plugin_list_item_t * array, int * count, lua_State * L, const char * label) {
+    char group_copy[33] = { 0 };
+    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
+        lua_getfield(L, 4, "group");
+        if (!lua_isnil(L, -1)) {
+            size_t group_len = 0;
+            bool is_string = lua_type(L, -1) == LUA_TSTRING;
+            const char * group = lua_tolstring(L, -1, &group_len);
+            if (!is_string || !group || group_len > 32 || memchr(group, '\0', group_len)) {
+                lua_pop(L, 1);
+                luaL_error(L, "plugin.register_list_item: group must be a string of at most 32 bytes without NUL");
+            }
+            if (group_len) memcpy(group_copy, group, group_len);
+        }
+        lua_pop(L, 1);
+    }
+
+    lua_pushvalue(L, 3);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    plugin_list_item_t * item = &array[(*count)++];
+    item->L = plugin_main_state(L);
+    item->open_ref = ref;
+    utf8_truncate_safe(item->label, label, sizeof(item->label));
+    utf8_sanitize(item->label);
+    item->icon_path[0] = '\0';
+    item->row_height = 0;
+    item->row_width = 0;
+    item->text_size[0] = '\0';
+    snprintf(item->group, sizeof(item->group), "%s", group_copy);
+
+    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
+        lua_getfield(L, 4, "icon");
+        const char * icon = lua_tostring(L, -1);
+        if (icon) snprintf(item->icon_path, sizeof(item->icon_path), "%s", icon);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 4, "height");
+        item->row_height = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 4, "width");
+        item->row_width = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 4, "text_size");
+        const char * text_size = lua_tostring(L, -1);
+        if (text_size) {
+            if (!is_valid_text_size(text_size)) {
+                lua_pop(L, 1);
+                luaL_error(L, "plugin.register_list_item: unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
+                           text_size);
+            }
+            snprintf(item->text_size, sizeof(item->text_size), "%s", text_size);
+        }
+        lua_pop(L, 1);
+
+    }
+}
+
+/* Adds a row to an existing native list screen -- see PLUGIN_MAX_SETTINGS_
+ * LIST_ITEMS's own comment in plugin_manager.h. list_id is checked against
+ * plugin_list_targets[]'s own fixed
+ * set of recognized strings ("settings", "display", ...) rather than accepted
+ * as-is: a typo'd or unsupported list_id should fail loudly at plugin load
+ * time, not silently register into nothing. */
+static int l_plugin_register_list_item(lua_State * L) {
+    const char * list_id = luaL_checkstring(L, 1);
+    const char * label = luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+
+    for (int i = 0; i < PLUGIN_LIST_TARGET_COUNT; i++) {
+        if (strcmp(list_id, plugin_list_targets[i].list_id) == 0) {
+            if (plugin_list_item_counts[i] >= plugin_list_targets[i].max_items) {
+                return luaL_error(L, "plugin.register_list_item: too many items registered for \"%s\" (max %d)",
+                                  plugin_list_targets[i].list_id, plugin_list_targets[i].max_items);
+            }
+            append_list_item(plugin_list_items[i], &plugin_list_item_counts[i], L, label);
+            return 0;
+        }
+    }
+
+    return luaL_error(L, "plugin.register_list_item: unknown list_id '%s' (expected \"settings\", \"display\", \"playback\", \"music_audio\", \"music_controls\", \"music_timers\", \"music_library\", \"power\", \"system\", \"radio\", or \"developer\")", list_id);
+}
+
+/* Registers a Stream Media tile, appended after the built-in Subsonic tile.
+ * Defaults icon to "stream_media/radio.png" if not specified. */
+static int l_plugin_register_stream_media_tile(lua_State * L) {
+    const char * label = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    const char * icon = (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) ? luaL_checkstring(L, 3) : NULL;
+
+    if (plugin_stream_tile_count >= PLUGIN_MAX_STREAM_TILES) {
+        return luaL_error(L, "too many stream media tiles registered (max %d)", PLUGIN_MAX_STREAM_TILES);
+    }
+
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    plugin_tile_t * t = &plugin_stream_tiles[plugin_stream_tile_count++];
+    t->L = plugin_main_state(L);
+    t->open_ref = ref;
+    utf8_truncate_safe(t->label, label, sizeof(t->label));
+    utf8_sanitize(t->label);
+    fill_tile_icon(t, icon, "stream_media/radio.png", "stream_media/radio_s.png");
+    return 0;
+}
+
+/* Defined further down this file (duplicate-plugin-id checking). */
+static bool plugin_id_is_valid(const char * id);
+static int push_plugin_error(lua_State * L, const char * message);
+
+static int plugin_find_quick_toggle_by_id(const char * id) {
+    if (!id) return -1;
+    for (int i = 0; i < plugin_quick_toggle_count; i++) {
+        if (strcmp(plugin_quick_toggles[i].id, id) == 0) return i;
+    }
+    return -1;
+}
+
+/* plugin.register_quick_toggle(id, label, on_change, options) -- adds an
+ * on/off tile to the quick drawer's expanded third row. `options` carries
+ * icon (required), plus the optional icon_selected / value / on_text /
+ * off_text. Ids use the plugin id character set; the "_s.png" sibling is
+ * derived from `icon` the same way unless icon_selected says otherwise, so
+ * a plugin shipping the usual pair only names one path. */
+static int l_plugin_register_quick_toggle(lua_State * L) {
+    const char * id = luaL_checkstring(L, 1);
+    const char * label = luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+
+    if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(plugin_quick_toggles[0].id)) {
+        return luaL_error(L, "plugin.register_quick_toggle: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
+                          sizeof(plugin_quick_toggles[0].id) - 1);
+    }
+    if (plugin_find_quick_toggle_by_id(id) >= 0) {
+        return luaL_error(L, "plugin.register_quick_toggle: id '%s' is already registered", id);
+    }
+    if (plugin_quick_toggle_count >= PLUGIN_MAX_QUICK_TOGGLES) {
+        return luaL_error(L, "too many quick toggles registered (max %d)", PLUGIN_MAX_QUICK_TOGGLES);
+    }
+    if (lua_gettop(L) < 4 || !lua_istable(L, 4)) {
+        return luaL_error(L, "plugin.register_quick_toggle: options table with an `icon` is required");
+    }
+
+    lua_getfield(L, 4, "icon");
+    const char * icon = lua_tostring(L, -1);
+    /* 80-byte ceiling: the extension strip below runs through a shorter
+     * scratch buffer than the stored path, so a longer icon would yield an
+     * icon/icon_selected pair naming unrelated files. */
+    if (!icon || icon[0] == '\0' || strlen(icon) >= 80) {
+        lua_pop(L, 1);
+        return luaL_error(L, "plugin.register_quick_toggle: icon must be a non-empty path under 80 characters");
+    }
+    /* 80, matching the length check above, so the extension-strip copy below
+     * is same-size and cannot truncate. */
+    char icon_copy[80];
+    snprintf(icon_copy, sizeof(icon_copy), "%s", icon);
+    lua_pop(L, 1);
+
+    plugin_quick_toggle_t * t = &plugin_quick_toggles[plugin_quick_toggle_count];
+
+    char base[80];
+    snprintf(base, sizeof(base), "%s", icon_copy);
+    char * dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+    snprintf(t->icon, sizeof(t->icon), "%s", icon_copy);
+    snprintf(t->icon_selected, sizeof(t->icon_selected), "%s_s.png", base);
+
+    lua_getfield(L, 4, "icon_selected");
+    const char * icon_sel = lua_tostring(L, -1);
+    if (icon_sel && icon_sel[0] != '\0')
+        snprintf(t->icon_selected, sizeof(t->icon_selected), "%s", icon_sel);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 4, "on_text");
+    const char * on_text = lua_tostring(L, -1);
+    snprintf(t->on_text, sizeof(t->on_text), "%s", on_text && on_text[0] ? on_text : TR("On"));
+    utf8_sanitize(t->on_text);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 4, "off_text");
+    const char * off_text = lua_tostring(L, -1);
+    snprintf(t->off_text, sizeof(t->off_text), "%s", off_text && off_text[0] ? off_text : TR("Off"));
+    utf8_sanitize(t->off_text);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 4, "value");
+    t->value = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+
+    t->on_hold_ref = LUA_NOREF;
+    lua_getfield(L, 4, "on_hold");
+    if (!lua_isnil(L, -1)) {
+        if (!lua_isfunction(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "plugin.register_quick_toggle: on_hold must be a function");
+        }
+        t->on_hold_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_pop(L, 1);
+    }
+
+    /* Ref taken last: every rejection above must leave the registry and the
+     * Lua registry untouched, not leak a ref for a toggle that never landed. */
+    lua_pushvalue(L, 3);
+    t->change_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    t->L = plugin_main_state(L);
+    snprintf(t->id, sizeof(t->id), "%s", id);
+    utf8_truncate_safe(t->label, label, sizeof(t->label));
+    utf8_sanitize(t->label);
+    plugin_quick_toggle_count++;
+    return 0;
+}
+
+/* plugin.set_quick_toggle(id, value) -- publishes a state change the plugin
+ * made on its own (from its settings screen, say) so the drawer shows it the
+ * next time it opens. Deliberately does NOT fire on_change: the plugin is the
+ * one telling us, so calling back into it would just loop. */
+static int l_plugin_set_quick_toggle(lua_State * L) {
+    const char * id = luaL_checkstring(L, 1);
+    luaL_checkany(L, 2);
+    int index = plugin_find_quick_toggle_by_id(id);
+    if (index < 0) {
+        return luaL_error(L, "plugin.set_quick_toggle: no quick toggle registered with id '%s'", id);
+    }
+    plugin_quick_toggles[index].value = lua_toboolean(L, 2);
+    return 0;
+}
+
+/* Each items[] entry is either a plain string (today's original behavior,
+ * unchanged) or a table { label = "...", icon = "...", text_size = "...",
+ * wrap = true } for a row that wants its own icon/text size or wrapped label
+ * -- see docs/PLUGINS.md. An optional trailing `options` table (4th arg) carries
+ * `height` and `width`, applying to every row in this call (call-level,
+ * setting -- a plain browsing list mixing wildly different row heights
+ * would look broken in a way an occasional taller settings-submenu row
+ * doesn't, see docs/PLUGINS.md). */
+static int l_plugin_show_list(lua_State * L) {
+    const char * title = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+
+    lua_Unsigned raw_n = lua_rawlen(L, 2);
+    int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
+
+    size_t label_capacity = 160;
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, 2, i + 1);
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "wrap");
+            if (lua_isboolean(L, -1) && lua_toboolean(L, -1)) label_capacity = 512;
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+        if (label_capacity == 512) break;
+    }
+    size_t alloc_n = (n > 0) ? (size_t) n : 1;
+    char * label_bufs = lua_newuserdata(L, alloc_n * label_capacity);
+    bool * wrap_labels = lua_newuserdata(L, (size_t) alloc_n * sizeof(*wrap_labels));
+    const char ** labels = lua_newuserdata(L, (size_t) alloc_n * sizeof(*labels));
+    char (*icon_bufs)[256] = lua_newuserdata(L, (size_t) alloc_n * sizeof(*icon_bufs));
+    const char ** icon_paths = lua_newuserdata(L, (size_t) alloc_n * sizeof(*icon_paths));
+    char (*text_size_bufs)[8] = lua_newuserdata(L, (size_t) alloc_n * sizeof(*text_size_bufs));
+    const char ** text_sizes = lua_newuserdata(L, (size_t) alloc_n * sizeof(*text_sizes));
+
+    for (int i = 0; i < n; i++) {
+        char * label_buf = label_bufs + (size_t)i * label_capacity;
+        lua_rawgeti(L, 2, i + 1);
+        icon_bufs[i][0] = '\0';
+        icon_paths[i] = NULL;
+        text_size_bufs[i][0] = '\0';
+        text_sizes[i] = NULL;
+        wrap_labels[i] = false;
+
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "wrap");
+            if (!lua_isnil(L, -1)) {
+                luaL_checktype(L, -1, LUA_TBOOLEAN);
+                wrap_labels[i] = lua_toboolean(L, -1);
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "label");
+            const char * s = lua_tostring(L, -1);
+            snprintf(label_buf, wrap_labels[i] ? label_capacity : 160, "%s", s ? s : "");
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "icon");
+            const char * icon = lua_tostring(L, -1);
+            if (icon) {
+                snprintf(icon_bufs[i], sizeof(icon_bufs[i]), "%s", icon);
+                icon_paths[i] = icon_bufs[i];
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "text_size");
+            const char * text_size = lua_tostring(L, -1);
+            if (text_size) {
+                if (!is_valid_text_size(text_size)) {
+                    return luaL_error(L, "plugin.show_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
+                                       i + 1, text_size);
+                }
+                snprintf(text_size_bufs[i], sizeof(text_size_bufs[i]), "%s", text_size);
+                text_sizes[i] = text_size_bufs[i];
+            }
+            lua_pop(L, 1);
+        } else {
+            const char * s = lua_tostring(L, -1);
+            snprintf(label_buf, 160, "%s", s ? s : "");
+        }
+        labels[i] = label_buf;
+        lua_pop(L, 1);
+    }
+
+    int32_t height = 0;
+    int32_t width = 0;
+    int selected_index = -1;
+    int columns = 0;
+    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
+        lua_getfield(L, 4, "layout");
+        if (!lua_isnil(L, -1)) {
+            const char * layout = luaL_checkstring(L, -1);
+            if (strcmp(layout, "grid") == 0) columns = 3;
+            else if (strcmp(layout, "list") != 0)
+                return luaL_error(L, "plugin.show_list: layout must be \"list\" or \"grid\"");
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 4, "columns");
+        if (!lua_isnil(L, -1)) {
+            lua_Integer c = luaL_checkinteger(L, -1);
+            if (c < 2 || c > 4) return luaL_error(L, "plugin.show_list: columns must be 2..4");
+            if (columns > 0) columns = (int) c;
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 4, "height");
+        height = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+        lua_getfield(L, 4, "width");
+        width = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+        lua_getfield(L, 4, "selected");
+        if (!lua_isnil(L, -1)) {
+            lua_Integer selected = luaL_checkinteger(L, -1);
+            if (selected < 1 || selected > n)
+                return luaL_error(L, "plugin.show_list: selected index %lld is outside 1..%d",
+                                  (long long) selected, n);
+            selected_index = (int) selected - 1;
+        }
+        lua_pop(L, 1);
+    }
+
+    lua_pushvalue(L, 3);
+    int new_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int slot = gui_plugin_show_list(title, labels, icon_paths, text_sizes, wrap_labels, height, width, selected_index, n, columns);
+    plugin_list_callback_t * cb = &plugin_list_callbacks[slot];
+    if (plugin_state_usable(cb->L) && cb->select_ref != LUA_NOREF) luaL_unref(cb->L, LUA_REGISTRYINDEX, cb->select_ref);
+    cb->L = plugin_main_state(L);
+    cb->select_ref = new_ref;
+    cb->handle = plugin_list_next_handle++;
+    lua_pushinteger(L, cb->handle);
+    return 1;
+}
+
+/* plugin.is_list_showing(handle): true while the list show_list() returned
+ * handle for is the screen in front (not closed, covered, or replaced). */
+static int l_plugin_is_list_showing(lua_State * L) {
+    lua_Integer handle = luaL_checkinteger(L, 1);
+    bool showing = false;
+    for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
+        if (plugin_list_callbacks[i].handle == handle) {
+            showing = handle > 0 && gui_plugin_list_is_top(i);
+            break;
+        }
+    }
+    lua_pushboolean(L, showing);
+    return 1;
+}
+
+/* plugin.show_settings_list(title, items) -- a nested settings submenu with
+ * real toggle/slider rows, see this file's own top-of-file doc comment.
+ * Each Lua item is a table: { type = "row"|"toggle"|"slider", label = ...,
+ * on_select = fn }  (type == "row") or  { ..., value = bool, on_change = fn }
+ * (type == "toggle")  or  { ..., min = n, max = n, value = n, on_change = fn }
+ * (type == "slider"). A "row" whose on_select calls show_settings_list()
+ * again is how a plugin nests a submenu inside a submenu -- same chaining
+ * convention plugin.show_list() already supports.
+ *
+ * Rows past PLUGIN_SETTINGS_LIST_MAX_ROWS, and "slider" rows past
+ * PLUGIN_SETTINGS_LIST_MAX_SLIDERS within one call, are silently dropped --
+ * same truncate-don't-error convention as l_plugin_show_list()'s own
+ * PLUGIN_MAX_LIST_ITEMS cap. An item with an unknown/missing `type`, or
+ * missing its required callback, raises a Lua error (fail loudly at call
+ * time, same convention l_plugin_register_list_item() uses for a bad
+ * list_id). */
+static int l_plugin_show_settings_list(lua_State * L) {
+    const char * title = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    lua_Unsigned raw_n = lua_rawlen(L, 2);
+    int n = (raw_n > (lua_Unsigned) PLUGIN_SETTINGS_LIST_MAX_ROWS) ? PLUGIN_SETTINGS_LIST_MAX_ROWS : (int) raw_n;
+
+    static char label_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][512];
+    static bool wrap_labels[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static const char * labels[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int row_types[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static bool toggle_initial[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int slider_min[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int slider_max[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int slider_value[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static char icon_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][256];
+    static const char * icon_paths[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int32_t heights[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int32_t widths[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static char text_size_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][8];
+    static const char * text_sizes[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    int new_refs[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+
+    int count = 0;
+    int slider_count = 0;
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, 2, i + 1); /* row table -> stack top */
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            continue;
+        }
+
+        lua_getfield(L, -1, "type");
+        const char * type = lua_tostring(L, -1);
+        int row_type = -1;
+        if (type) {
+            if (strcmp(type, "row") == 0) row_type = PLUGIN_SETTINGS_ROW_TAP;
+            else if (strcmp(type, "toggle") == 0) row_type = PLUGIN_SETTINGS_ROW_TOGGLE;
+            else if (strcmp(type, "slider") == 0) row_type = PLUGIN_SETTINGS_ROW_SLIDER;
+        }
+        if (row_type < 0) {
+            return luaL_error(L, "plugin.show_settings_list: row %d has an unknown or missing type (expected \"row\", \"toggle\", or \"slider\")", i + 1);
+        }
+        lua_pop(L, 1); /* type string */
+
+        if (row_type == PLUGIN_SETTINGS_ROW_SLIDER && slider_count >= PLUGIN_SETTINGS_LIST_MAX_SLIDERS) {
+            lua_pop(L, 1); /* row table */
+            continue;
+        }
+
+        lua_getfield(L, -1, "wrap");
+        if (!lua_isnil(L, -1)) luaL_checktype(L, -1, LUA_TBOOLEAN);
+        wrap_labels[count] = row_type != PLUGIN_SETTINGS_ROW_SLIDER && lua_toboolean(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "label");
+        const char * label = lua_tostring(L, -1);
+        snprintf(label_bufs[count], wrap_labels[count] ? sizeof(label_bufs[count]) : 96,
+                 "%s", label ? label : "");
+        lua_pop(L, 1); /* label string */
+
+        const char * cb_field = (row_type == PLUGIN_SETTINGS_ROW_TAP) ? "on_select" : "on_change";
+        lua_getfield(L, -1, cb_field);
+        if (!lua_isfunction(L, -1)) {
+            return luaL_error(L, "plugin.show_settings_list: row %d ('%s') missing %s function", i + 1, label ? label : "", cb_field);
+        }
+        new_refs[count] = luaL_ref(L, LUA_REGISTRYINDEX); /* pops the function */
+
+        toggle_initial[count] = false;
+        slider_min[count] = 0;
+        slider_max[count] = 100;
+        slider_value[count] = 0;
+        if (row_type == PLUGIN_SETTINGS_ROW_TOGGLE) {
+            lua_getfield(L, -1, "value");
+            toggle_initial[count] = lua_toboolean(L, -1);
+            lua_pop(L, 1);
+        } else if (row_type == PLUGIN_SETTINGS_ROW_SLIDER) {
+            lua_getfield(L, -1, "min");
+            slider_min[count] = (int) luaL_optinteger(L, -1, 0);
+            lua_pop(L, 1);
+            lua_getfield(L, -1, "max");
+            slider_max[count] = (int) luaL_optinteger(L, -1, 100);
+            lua_pop(L, 1);
+            lua_getfield(L, -1, "value");
+            slider_value[count] = (int) luaL_optinteger(L, -1, slider_min[count]);
+            lua_pop(L, 1);
+        }
+
+        icon_bufs[count][0] = '\0';
+        icon_paths[count] = NULL;
+        lua_getfield(L, -1, "icon");
+        const char * icon = lua_tostring(L, -1);
+        if (icon) {
+            snprintf(icon_bufs[count], sizeof(icon_bufs[count]), "%s", icon);
+            icon_paths[count] = icon_bufs[count];
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "height");
+        heights[count] = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "width");
+        widths[count] = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        text_size_bufs[count][0] = '\0';
+        text_sizes[count] = NULL;
+        lua_getfield(L, -1, "text_size");
+        const char * text_size = lua_tostring(L, -1);
+        if (text_size) {
+            if (!is_valid_text_size(text_size)) {
+                return luaL_error(L, "plugin.show_settings_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
+                                   i + 1, text_size);
+            }
+            snprintf(text_size_bufs[count], sizeof(text_size_bufs[count]), "%s", text_size);
+            text_sizes[count] = text_size_bufs[count];
+        }
+        lua_pop(L, 1);
+
+        labels[count] = label_bufs[count];
+        row_types[count] = row_type;
+        if (row_type == PLUGIN_SETTINGS_ROW_SLIDER) slider_count++;
+        count++;
+
+        lua_pop(L, 1); /* row table */
+    }
+
+    int slot = gui_plugin_show_settings_list(title, row_types, labels, toggle_initial, slider_min, slider_max,
+                                              slider_value, icon_paths, heights, widths, text_sizes, wrap_labels, count);
+    if (slot < 0 || slot >= PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE) return 0; /* defensive -- shouldn't happen */
+
+    /* Release whatever the reused slot held from its previous population
+     * before overwriting -- see plugin_settings_list_rows[]'s own comment on
+     * why this is per-slot storage rather than one shared "current" ref. */
+    for (int i = 0; i < plugin_settings_list_row_counts[slot]; i++) {
+        if (plugin_state_usable(plugin_settings_list_rows[slot][i].L)) {
+            luaL_unref(plugin_settings_list_rows[slot][i].L, LUA_REGISTRYINDEX,
+                       plugin_settings_list_rows[slot][i].callback_ref);
+        }
+    }
+    lua_State * main_L = plugin_main_state(L);
+    for (int i = 0; i < count; i++) {
+        plugin_settings_list_rows[slot][i].L = main_L;
+        plugin_settings_list_rows[slot][i].callback_ref = new_refs[i];
+    }
+    plugin_settings_list_row_counts[slot] = count;
+
+    return 0;
+}
+
+static int l_plugin_list_dir(lua_State * L) {
+    const char * path = check_plugin_external_path(L, 1, "plugin.list_dir");
+    lua_newtable(L);
+
+    DIR * d = opendir(path);
+    if (!d) return 1;
+
+    int idx = 1;
+    struct dirent * ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        struct stat st;
+        bool is_dir = false;
+        bool have_stat = stat(full, &st) == 0;
+        if (have_stat) is_dir = S_ISDIR(st.st_mode);
+
+        lua_newtable(L);
+        lua_pushstring(L, ent->d_name);
+        lua_setfield(L, -2, "name");
+        lua_pushboolean(L, is_dir);
+        lua_setfield(L, -2, "dir");
+        if (have_stat) {
+            lua_pushinteger(L, (lua_Integer) st.st_size);
+            lua_setfield(L, -2, "size");
+            lua_pushinteger(L, (lua_Integer) st.st_mtime);
+            lua_setfield(L, -2, "modified");
+        }
+        lua_rawseti(L, -2, idx++);
+    }
+    closedir(d);
+    return 1;
+}
+
+static int l_plugin_sd_root(lua_State * L) {
+    lua_pushstring(L, MUSIC_ROOT_DIR);
+    return 1;
+}
+
+/* plugin.paths() -> { sd_root =, state_root =, install_root = } (capability
+ * "filesystem.paths"): the card, the player's state on it
+ * (<card>/.mellowtone: config/, logs/, plugins/ ...) and the read-only
+ * install directory in flash. */
+static int l_plugin_paths(lua_State * L) {
+    lua_createtable(L, 0, 3);
+    lua_pushstring(L, MUSIC_ROOT_DIR); lua_setfield(L, -2, "sd_root");
+    lua_pushstring(L, MT_STATE_ROOT); lua_setfield(L, -2, "state_root");
+#ifdef HOST_BUILD
+    lua_pushstring(L, MT_INSTALL_ROOT); lua_setfield(L, -2, "install_root");
+#else
+    lua_pushstring(L, board_install_root()); lua_setfield(L, -2, "install_root"); /* image install: rootfs */
+#endif
+    return 1;
+}
+
+/* plugin.mkdir(path) -> true | nil, error. mkdir -p semantics: existing
+ * directories are success, while an existing non-directory remains an
+ * error. This intentionally follows Lua's existing unrestricted path-based
+ * file operations; plugins are not confined to sd_root() today. */
+/* plugin.fs_usage(path) -> { total = bytes, free = bytes } for the file
+ * system holding path (statvfs), or nil, error. */
+static int l_plugin_fs_usage(lua_State * L) {
+    const char * path = luaL_checkstring(L, 1);
+    struct statvfs sv;
+    if (statvfs(path, &sv) != 0) return push_plugin_error(L, strerror(errno));
+    lua_createtable(L, 0, 2);
+    lua_pushinteger(L, (lua_Integer) ((uint64_t) sv.f_blocks * sv.f_frsize));
+    lua_setfield(L, -2, "total");
+    lua_pushinteger(L, (lua_Integer) ((uint64_t) sv.f_bavail * sv.f_frsize));
+    lua_setfield(L, -2, "free");
+    return 1;
+}
+
+/* plugin.wifi_ssid() -> the network the player is connected to (the Wi-Fi
+ * core's cached state, no query here), or nil. */
+static int l_plugin_wifi_ssid(lua_State * L) {
+    char ssid[64];
+    if (wifi_status_last_ssid(ssid, sizeof(ssid)) && ssid[0]) lua_pushstring(L, ssid);
+    else lua_pushnil(L);
+    return 1;
+}
+
+/* Radio list (capability "radio.list"): stations go through
+ * radio_list.c so the base list, the card's Radio.txt and the hidden list
+ * stay consistent.
+ *   plugin.radio_list() -> { { name =, url =, base = bool }, ... }
+ *   plugin.radio_add(name, url) -> true | nil, error  (a removed built-in
+ *                                   station is shown again)
+ *   plugin.radio_remove(url) -> true | nil, error     (a card station is
+ *                                   deleted, a built-in one hidden) */
+static int l_plugin_radio_list(lua_State * L) {
+    radio_entries_t list;
+    if (!radio_list_load(&list, false)) return push_plugin_error(L, "could not read the Radio list");
+    lua_createtable(L, list.count, 0);
+    for (int i = 0; i < list.count; i++) {
+        lua_createtable(L, 0, 3);
+        lua_pushstring(L, list.items[i].name); lua_setfield(L, -2, "name");
+        lua_pushstring(L, list.items[i].url); lua_setfield(L, -2, "url");
+        lua_pushboolean(L, list.items[i].base); lua_setfield(L, -2, "base");
+        lua_rawseti(L, -2, i + 1);
+    }
+    radio_entries_free(&list);
+    return 1;
+}
+
+static int l_plugin_radio_add(lua_State * L) {
+    const char * name = luaL_optstring(L, 1, "");
+    const char * url = luaL_checkstring(L, 2);
+    radio_result_t r = radio_list_add(name, url);
+    if (r == RADIO_OK || r == RADIO_ADDED_RESTORED) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    return push_plugin_error(L, radio_result_text(r));
+}
+
+static int l_plugin_radio_remove(lua_State * L) {
+    radio_result_t r = radio_list_remove(luaL_checkstring(L, 1));
+    if (r == RADIO_OK) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    return push_plugin_error(L, radio_result_text(r));
+}
+
+static int l_plugin_mkdir(lua_State * L) {
+    const char * path = check_plugin_writable_path(L, 1, "plugin.mkdir");
+    size_t len = strlen(path);
+    if (len == 0 || len >= PATH_MAX) {
+        return push_plugin_error(L, "invalid path");
+    }
+
+    char buf[PATH_MAX];
+    memcpy(buf, path, len + 1);
+    while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
+
+    for (size_t i = 1; i <= len; i++) {
+        if (buf[i] != '/' && buf[i] != '\0') continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        if (buf[0] != '\0' && mkdir(buf, 0755) != 0) {
+            int saved_errno = errno;
+            struct stat st;
+            if (saved_errno != EEXIST || stat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                buf[i] = saved;
+                lua_pushnil(L);
+                lua_pushstring(L, strerror(saved_errno));
+                return 2;
+            }
+        }
+        buf[i] = saved;
+    }
+
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int l_plugin_play_file(lua_State * L) {
+    const char * path = check_plugin_external_path(L, 1, "plugin.play_file");
+    gui_plugin_play_paths(&path, 1, 0);
+    return 0;
+}
+
+static int l_plugin_play_list(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int start = (int) luaL_optinteger(L, 2, 1) - 1;
+
+    lua_Unsigned raw_n = lua_rawlen(L, 1);
+    int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
+    if (n <= 0) return 0;
+    if (start < 0) start = 0;
+    if (start >= n) start = n - 1;
+
+    char (*path_bufs)[512] = lua_newuserdata(L, (size_t) n * sizeof(*path_bufs));
+    const char ** paths = lua_newuserdata(L, (size_t) n * sizeof(*paths));
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, 1, i + 1);
+        const char * s = lua_tostring(L, -1);
+        if (s && plugin_storage_path_is_reserved(s)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "plugin.play_list: path is reserved (player settings, plugin.storage, plugin.secrets)");
+        }
+        snprintf(path_bufs[i], sizeof(path_bufs[i]), "%s", s ? s : "");
+        paths[i] = path_bufs[i];
+        lua_pop(L, 1);
+    }
+
+    gui_plugin_play_paths(paths, n, start);
+    return 0;
+}
+
+/* Shared by every numeric remote-track field below -- rejects (rather than
+ * silently wrapping/truncating via an unsigned cast, which is what a bare
+ * "(uint32_t) luaL_optnumber(...)" would otherwise do) a negative value, a
+ * NaN, an infinity, or anything past max_value. A plain lua_Number
+ * comparison against a finite max_value already correctly rejects NaN
+ * (every comparison against NaN is false) and +-infinity (always outside
+ * any finite range) with no separate isnan()/isfinite() check needed. */
+static lua_Number check_bounded_number(lua_State * L, int table_index, const char * field, const char * fn_name, lua_Number max_value) {
+    lua_getfield(L, table_index, field);
+    lua_Number val = luaL_optnumber(L, -1, 0);
+    lua_pop(L, 1);
+    if (!(val >= 0) || !(val <= max_value)) {
+        luaL_error(L, "%s: %s must be a finite number between 0 and %.0f", fn_name, field, (double) max_value);
+    }
+    return val;
+}
+
+/* Reads one remote_track_meta_t out of the Lua table at stack index
+ * table_index (a plain {provider=..., track_id=..., stream_url=..., ...}
+ * value, not a class/metatable of any kind). provider/track_id/stream_url
+ * are required; everything else defaults to empty/zero/true(verify_tls),
+ * matching plugin.http_request()'s own required-vs-optional-field style
+ * above. Raises a Lua error (via luaL_error, which never returns) on any
+ * oversized or missing-required field rather than silently truncating --
+ * same reasoning as l_plugin_http_request()'s own header-length fix. */
+static void parse_remote_track_table(lua_State * L, int table_index, remote_track_meta_t * out, const char * fn_name) {
+    memset(out, 0, sizeof(*out));
+
+    lua_getfield(L, table_index, "provider");
+    const char * provider = luaL_checkstring(L, -1);
+    if (provider[0] == '\0') luaL_error(L, "%s: provider must not be empty", fn_name);
+    if (strlen(provider) >= sizeof(out->provider)) luaL_error(L, "%s: provider is too long", fn_name);
+    snprintf(out->provider, sizeof(out->provider), "%s", provider);
+    lua_pop(L, 1);
+
+    lua_getfield(L, table_index, "track_id");
+    const char * track_id = luaL_checkstring(L, -1);
+    if (track_id[0] == '\0') luaL_error(L, "%s: track_id must not be empty", fn_name);
+    if (strlen(track_id) >= sizeof(out->track_id)) luaL_error(L, "%s: track_id is too long", fn_name);
+    snprintf(out->track_id, sizeof(out->track_id), "%s", track_id);
+    lua_pop(L, 1);
+
+    /* Reuses remote_track_make_key()'s own validation (non-empty, fits,
+     * and -- the part a plain non-empty/length check above can't catch --
+     * no '/' or control character in either field, which would otherwise
+     * let two different (provider, track_id) pairs produce the exact same
+     * "remote://..." key and collide in Favorites/History/play-count).
+     * Only the validity is used here; the key itself is recomputed
+     * on-demand wherever it's actually needed (remote_track.c). */
+    {
+        char key[256];
+        if (!remote_track_make_key(out->provider, out->track_id, key, sizeof(key))) {
+            luaL_error(L, "%s: provider/track_id must not contain '/' or control characters, and must fit the synthetic key", fn_name);
+        }
+    }
+
+    lua_getfield(L, table_index, "stream_url");
+    const char * stream_url = luaL_checkstring(L, -1);
+    if (stream_url[0] == '\0') luaL_error(L, "%s: stream_url must not be empty", fn_name);
+    if (strlen(stream_url) >= sizeof(out->stream_url)) luaL_error(L, "%s: stream_url is too long", fn_name);
+    snprintf(out->stream_url, sizeof(out->stream_url), "%s", stream_url);
+    lua_pop(L, 1);
+
+#define OPT_STR_FIELD(field, name) \
+    lua_getfield(L, table_index, name); \
+    const char * field##_val = luaL_optstring(L, -1, ""); \
+    if (strlen(field##_val) >= sizeof(out->field)) luaL_error(L, "%s: " name " is too long", fn_name); \
+    snprintf(out->field, sizeof(out->field), "%s", field##_val); \
+    lua_pop(L, 1);
+
+    OPT_STR_FIELD(title, "title")
+    OPT_STR_FIELD(artist, "artist")
+    OPT_STR_FIELD(album, "album")
+    OPT_STR_FIELD(artwork_url, "artwork_url")
+#undef OPT_STR_FIELD
+
+    lua_getfield(L, table_index, "codec");
+    const char * codec_val = luaL_optstring(L, -1, "");
+    /* Empty defaults to "mp3" (see remote_track.h's own comment) -- but an
+     * unrecognized NON-empty value is rejected outright rather than
+     * silently falling back to mp3, which would otherwise mean a typo'd
+     * codec ("flc", "opus") looks like it worked at queue time and only
+     * fails much later, confusingly, when decoder_open() actually tries
+     * to open a stream using the wrong decoder. */
+    if (codec_val[0] != '\0' && strcasecmp(codec_val, "mp3") != 0 && strcasecmp(codec_val, "flac") != 0 &&
+        strcasecmp(codec_val, "aac") != 0) {
+        luaL_error(L, "%s: unknown codec '%s' -- must be \"mp3\", \"flac\", \"aac\", or omitted", fn_name, codec_val);
+    }
+    if (strlen(codec_val) >= sizeof(out->codec)) luaL_error(L, "%s: codec is too long", fn_name);
+    snprintf(out->codec, sizeof(out->codec), "%s", codec_val);
+    lua_pop(L, 1);
+
+    /* Bounds are generous (well past anything a real audio stream would
+     * ever declare) -- these are display-only fields (format badge,
+     * quality metadata) except duration_ms, which also seeds the decoder's
+     * total_frames for a remote MP3/AAC stream (audio.c's decoder_open());
+     * the point is rejecting garbage (negative/NaN/absurdly large) before
+     * it's cast to an unsigned type below, not modeling real codec limits. */
+    out->duration_ms = (uint32_t) check_bounded_number(L, table_index, "duration_ms", fn_name, 24.0 * 3600.0 * 1000.0);
+    out->sample_rate = (unsigned int) check_bounded_number(L, table_index, "sample_rate", fn_name, 1000000.0);
+    out->bit_depth = (unsigned int) check_bounded_number(L, table_index, "bit_depth", fn_name, 64.0);
+    out->channels = (unsigned int) check_bounded_number(L, table_index, "channels", fn_name, 64.0);
+    out->bitrate_kbps = (unsigned int) check_bounded_number(L, table_index, "bitrate_kbps", fn_name, 100000.0);
+
+    lua_getfield(L, table_index, "replaygain_db");
+    if (!lua_isnil(L, -1)) {
+        double gain = luaL_checknumber(L, -1);
+        /* +-100 dB is already an absurd amount of gain -- this is purely a
+         * NaN/infinity/garbage-value guard (see resolve_replaygain()'s own
+         * comment for how this feeds into playback volume), not a
+         * meaningful real-world limit. */
+        if (!(gain >= -100.0 && gain <= 100.0)) luaL_error(L, "%s: replaygain_db must be a finite number between -100 and 100", fn_name);
+        out->has_replaygain = true;
+        out->replaygain_db = gain;
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, table_index, "verify_tls");
+    out->verify_tls = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
+    lua_pop(L, 1);
+}
+
+static int l_plugin_play_remote(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    remote_track_meta_t track;
+    parse_remote_track_table(L, 1, &track, "plugin.play_remote");
+    gui_plugin_play_remote_tracks(&track, 1, 0);
+    return 0;
+}
+
+static int l_plugin_queue_remote_list(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int start = (int) luaL_optinteger(L, 2, 1) - 1;
+
+    lua_Unsigned raw_n = lua_rawlen(L, 1);
+    int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
+    if (n <= 0) return 0;
+    if (start < 0) start = 0;
+    if (start >= n) start = n - 1;
+
+    /* remote_track_meta_t is a few KB each (mostly its bounded string
+     * fields) -- a fixed PLUGIN_MAX_LIST_ITEMS-sized static array here
+     * would be a ~2MB permanent footprint on this device regardless of how
+     * many tracks a given call actually queues. Sized to n (the real,
+     * already-capped count) instead, and allocated as Lua userdata rather
+     * than malloc()'d: parse_remote_track_table() below can luaL_error()
+     * (longjmp) mid-loop on a malformed entry, and a plain malloc()'d
+     * buffer would leak in that case since nothing downstream of a longjmp
+     * ever runs our own free() -- Lua's GC owns and reclaims userdata
+     * regardless of how the call unwinds, once nothing pushed after it on
+     * the stack (nothing is, here) keeps it live past this function. */
+    remote_track_meta_t * tracks = (remote_track_meta_t *) lua_newuserdata(L, sizeof(remote_track_meta_t) * (size_t) n);
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, 1, i + 1);
+        luaL_checktype(L, -1, LUA_TTABLE);
+        parse_remote_track_table(L, lua_gettop(L), &tracks[i], "plugin.queue_remote_list");
+        lua_pop(L, 1);
+    }
+
+    gui_plugin_play_remote_tracks(tracks, n, start);
+    return 0;
+}
+
+static int l_plugin_show_toast(lua_State * L) {
+    const char * msg = luaL_checkstring(L, 1);
+    lua_Integer duration_ms = luaL_optinteger(L, 2, 5000);
+    if (duration_ms < 100 || duration_ms > 30000)
+        return luaL_error(L, "plugin.show_toast: duration_ms must be between 100 and 30000");
+    gui_plugin_show_toast(msg, (uint32_t) duration_ms);
+    return 0;
+}
+
+#ifndef HOST_BUILD
+/* True when both paths exist as regular files of equal size and equal
+ * bytes. Used by copy_file() to skip a NAND rewrite of an icon that is
+ * already the requested image -- a theme plugin may copy ~140 assets on every
+ * load, and after the first successful apply those destinations already
+ * match. */
+static bool files_identical(const char * a_path, const char * b_path) {
+    struct stat sa, sb;
+    if (stat(a_path, &sa) != 0 || stat(b_path, &sb) != 0) return false;
+    if (!S_ISREG(sa.st_mode) || !S_ISREG(sb.st_mode)) return false;
+    if (sa.st_size != sb.st_size) return false;
+
+    FILE * a = fopen(a_path, "rb");
+    FILE * b = fopen(b_path, "rb");
+    if (!a || !b) {
+        if (a) fclose(a);
+        if (b) fclose(b);
+        return false;
+    }
+
+    char ba[4096], bb[4096];
+    bool same = true;
+    for (;;) {
+        size_t na = fread(ba, 1, sizeof(ba), a);
+        size_t nb = fread(bb, 1, sizeof(bb), b);
+        if (na != nb || memcmp(ba, bb, na) != 0) {
+            same = false;
+            break;
+        }
+        if (na == 0) break;
+    }
+    if (ferror(a) || ferror(b)) same = false;
+    fclose(a);
+    fclose(b);
+    return same;
+}
+
+/* Atomic byte copy: readers see either the old complete icon or the new
+ * one, never a partially-written PNG. */
+static bool copy_file(const char * src_path, const char * dst_path) {
+    if (files_identical(src_path, dst_path)) return true;
+    FILE * in = fopen(src_path, "rb");
+    if (!in) return false;
+    char tmp_path[640];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", dst_path, (long) getpid()) >= (int) sizeof(tmp_path)) {
+        fclose(in);
+        return false;
+    }
+    FILE * out = fopen(tmp_path, "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+
+    bool ok = true;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = false;
+            break;
+        }
+    }
+    ok = ok && !ferror(in);
+    fclose(in);
+    if (fclose(out) != 0) ok = false;
+
+    if (ok) ok = rename(tmp_path, dst_path) == 0;
+    if (!ok) remove(tmp_path);
+    return ok;
+}
+#endif
+
+/* Reskins an EXISTING theme asset in place, e.g.
+ * plugin.set_icon("launcher/music.png", plugin.sd_root() .. "/my_music.png")
+ * to change what Home's Music tile looks like -- a different case from
+ * plugin.register_stream_media_tile()'s own icon argument (which points a
+ * BRAND NEW tile at whatever icon it likes with no special handling
+ * needed). Copies source_path's bytes into
+ * THEME_OVERRIDE_ROOT/relative_path, the same writable-override mechanism
+ * assets.c's own asset_path() already checks first for every icon
+ * resolution in the app (already how Subsonic's own non-stock icon works
+ * today).
+ *
+ * LVGL caches decoded images by path, so callback-time batches must end
+ * with plugin.refresh_theme(). Startup calls need no refresh because
+ * plugin_manager_init() runs before the UI is built. */
+static int l_plugin_set_icon(lua_State * L) {
+    const char * relative_path = luaL_checkstring(L, 1);
+    const char * source_path = check_plugin_external_path(L, 2, "plugin.set_icon");
+
+#ifndef HOST_BUILD
+    /* Reject absolute paths and directory traversal to constrain writes
+     * within PLUGIN_THEME_OVERRIDE_ROOT. */
+    if (relative_path[0] == '/' || strstr(relative_path, "..") != NULL) {
+        return luaL_error(L, "plugin.set_icon: relative_path must be a plain path under the theme root, got '%s'",
+                           relative_path);
+    }
+
+    char dst_path[600];
+    snprintf(dst_path, sizeof(dst_path), "%s%s", PLUGIN_THEME_OVERRIDE_ROOT, relative_path);
+
+    /* Best-effort mkdir, ignore EEXIST -- same pattern
+     * playlist_files_create() already uses. Every real theme asset in
+     * this app is exactly one directory level deep (e.g. "launcher/",
+     * "stream_media/"), so one mkdir beyond the root is enough; this
+     * doesn't attempt a general recursive mkdir -p for deeper paths
+     * nothing in this app's own asset layout actually needs. */
+    mkdir(PLUGIN_THEME_OVERRIDE_ROOT, 0755);
+    char dir_only[600];
+    snprintf(dir_only, sizeof(dir_only), "%s", dst_path);
+    char * slash = strrchr(dir_only, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir(dir_only, 0755);
+    }
+
+    if (!copy_file(source_path, dst_path)) {
+        return luaL_error(L, "plugin.set_icon: could not copy '%s' to '%s'", source_path, relative_path);
+    }
+#else
+    (void) relative_path; (void) source_path; /* no override root on HOST_BUILD -- see assets.c's asset_path() */
+#endif
+    return 0;
+}
+
+/* Sets one of three fixed background-color slots, live, app-wide, no
+ * restart needed -- see gui_plugin_set_background_color()'s own comment
+ * in gui.c for the shared-style mechanism (same one apply_accent_color()
+ * already uses successfully for the existing accent color feature).
+ * "screen": every screen's own background. "card": popups, EQ cards,
+ * settings slider cards -- every neutral dark surface that isn't a plain
+ * screen or a list row. "list_row": every row in every list screen (All
+ * Songs, Artists, Playlists, Files, Queue, ...). */
+static int l_plugin_set_background_color(lua_State * L) {
+    const char * slot = luaL_checkstring(L, 1);
+    lua_Integer rgb = luaL_checkinteger(L, 2);
+
+    if (strcmp(slot, "screen") != 0 && strcmp(slot, "card") != 0 && strcmp(slot, "list_row") != 0) {
+        return luaL_error(L, "plugin.set_background_color: unknown slot '%s' (expected \"screen\", \"card\", or \"list_row\")",
+                           slot);
+    }
+
+    gui_plugin_set_background_color(slot, (uint32_t) rgb);
+    return 0;
+}
+
+/* Sets one of two fixed text-color slots, live, app-wide, no restart needed
+ * -- see gui_plugin_set_text_color()'s own comment in gui.c. "primary": the
+ * app's dominant near-white text (labels, titles, list rows). "muted":
+ * secondary/disabled-ish gray text (chevrons, timestamps, subtitles).
+ * Destructive-red and accent-tinted text are NOT covered by either slot --
+ * they're semantically fixed, not part of the light/dark background split
+ * plugin.set_background_color() drives. */
+static int l_plugin_set_text_color(lua_State * L) {
+    const char * slot = luaL_checkstring(L, 1);
+    lua_Integer rgb = luaL_checkinteger(L, 2);
+
+    if (strcmp(slot, "primary") != 0 && strcmp(slot, "muted") != 0) {
+        return luaL_error(L, "plugin.set_text_color: unknown slot '%s' (expected \"primary\" or \"muted\")", slot);
+    }
+
+    gui_plugin_set_text_color(slot, (uint32_t) rgb);
+    return 0;
+}
+
+/* Reads an optional 0xRRGGBB-style integer field into out_has/out_value --
+ * *out_has stays whatever the caller initialized it to (false) if the field
+ * is nil/absent, so a tile table that only sets some fields leaves the rest
+ * genuinely unset rather than defaulting to black/0. luaL_checkinteger (not
+ * lua_tointeger) so a wrong-typed value fails loudly rather than silently
+ * becoming 0, same convention every other typed plugin.* field uses. */
+static void get_opt_color_field(lua_State * L, int idx, const char * field, bool * out_has, uint32_t * out_value) {
+    lua_getfield(L, idx, field);
+    if (!lua_isnil(L, -1)) {
+        *out_has = true;
+        *out_value = (uint32_t) luaL_checkinteger(L, -1);
+    }
+    lua_pop(L, 1);
+}
+
+/* Same shape, for an optional boolean field (accessory/icon) -- lua_toboolean
+ * alone can't tell "false" apart from "absent", both would otherwise read as
+ * false, so *out_has records whether the field was actually present.
+ * lua_toboolean() itself (not a stricter LUA_TBOOLEAN type check) is
+ * deliberate: Lua's own C API has no narrower notion of "boolean" than
+ * truthiness, and every other boolean-ish field in this file (toggle
+ * initial state, verify_tls, ...) already reads exactly this way -- adding
+ * a stricter check here alone would make this one field the inconsistent
+ * one, not the other way around. */
+static void get_opt_bool_field(lua_State * L, int idx, const char * field, bool * out_has, bool * out_value) {
+    lua_getfield(L, idx, field);
+    if (!lua_isnil(L, -1)) {
+        *out_has = true;
+        *out_value = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
+}
+
+/* Validates that a 64-bit Lua integer fits within int32_t bounds before casting. */
+static int32_t check_int32_field(lua_State * L, lua_Integer value, const char * fn_name, const char * field) {
+    if (value < INT32_MIN || value > INT32_MAX) {
+        return (int32_t) luaL_error(L, "%s: %s (%lld) is out of range", fn_name, field, (long long) value);
+    }
+    return (int32_t) value;
+}
+
+static void parse_launcher_menu_layout(lua_State * L, int idx, const char * menu,
+                                       launcher_menu_layout_t * out) {
+    idx = lua_absindex(L, idx);
+    lua_getfield(L, idx, "row_gap");
+    out->row_gap = check_int32_field(L, luaL_optinteger(L, -1, 0),
+                                     "plugin.set_launcher_layout", "row_gap");
+    lua_pop(L, 1);
+    lua_getfield(L, idx, "height");
+    out->height = check_int32_field(L, luaL_optinteger(L, -1, 0),
+                                    "plugin.set_launcher_layout", "height");
+    lua_pop(L, 1);
+    lua_getfield(L, idx, "width");
+    out->width = check_int32_field(L, luaL_optinteger(L, -1, 0),
+                                   "plugin.set_launcher_layout", "width");
+    lua_pop(L, 1);
+
+    get_opt_color_field(L, idx, "bg_color", &out->has_bg_color, &out->bg_color);
+    get_opt_color_field(L, idx, "text_color", &out->has_text_color, &out->text_color);
+    lua_getfield(L, idx, "radius");
+    if (!lua_isnil(L, -1)) {
+        lua_Integer radius = luaL_checkinteger(L, -1);
+        if (radius < 0) luaL_error(L, "plugin.set_launcher_layout: %s.radius cannot be negative", menu);
+        out->has_radius = true;
+        out->radius = check_int32_field(L, radius, "plugin.set_launcher_layout", "radius");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, idx, "align");
+    const char * align = lua_tostring(L, -1);
+    if (align) {
+        if (strcmp(align, "left") != 0 && strcmp(align, "center") != 0 && strcmp(align, "right") != 0)
+            luaL_error(L, "plugin.set_launcher_layout: %s.align must be left, center, or right", menu);
+        snprintf(out->align, sizeof(out->align), "%s", align);
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, idx, "text_size");
+    const char * text_size = lua_tostring(L, -1);
+    if (text_size) {
+        if (!is_valid_text_size(text_size))
+            luaL_error(L, "plugin.set_launcher_layout: %s.text_size is invalid", menu);
+        snprintf(out->text_size, sizeof(out->text_size), "%s", text_size);
+    }
+    lua_pop(L, 1);
+    get_opt_bool_field(L, idx, "accessory", &out->has_accessory, &out->accessory);
+    get_opt_bool_field(L, idx, "icon", &out->has_icon, &out->icon);
+}
+
+static int l_plugin_set_launcher_layout(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    launcher_layout_config_t config;
+    memset(&config, 0, sizeof(config));
+    const char * names[] = { "music", "stream_media", "wireless" };
+    launcher_menu_layout_t * menus[] = { &config.music, &config.stream_media, &config.wireless };
+    for (int i = 0; i < 3; i++) {
+        lua_getfield(L, 1, names[i]);
+        if (!lua_isnil(L, -1)) {
+            if (!lua_istable(L, -1))
+                return luaL_error(L, "plugin.set_launcher_layout: %s must be a table", names[i]);
+            parse_launcher_menu_layout(L, -1, names[i], menus[i]);
+        }
+        lua_pop(L, 1);
+    }
+    gui_plugin_set_launcher_layout(&config);
+    return 0;
+}
+
+/* plugin.reload_ui() -- rebuilds every screen/style in the same process
+ * (see gui_reload.h/.c) so a plugin.set_icon()/set_background_color()/
+ * set_text_color()/set_launcher_layout() call takes full effect without
+ * needing the player killed and relaunched. Never touches audio playback
+ * or any network/Bluetooth/D-Bus connection -- see gui_reload.c's own top
+ * comment for the exact scope.
+ *
+ * Deliberately does NOT call gui_soft_reload() directly: this binding runs
+ * via plugin_call() on the calling plugin's own lua_State, still live on
+ * the C stack inside lua_pcall() -- gui_soft_reload() closes every plugin's
+ * L, including this one, which would be undefined behavior if done while
+ * that same L is still executing. gui_reload_request() only schedules the
+ * real reload on a short LVGL timer, strictly after this call (and the
+ * whole plugin_call() it's part of) has returned. */
+static int l_plugin_reload_ui(lua_State * L) {
+    (void) L;
+    gui_reload_request();
+    return 0;
+}
+
+static int l_plugin_refresh_theme(lua_State * L) {
+    (void) L;
+    gui_theme_refresh_request();
+    return 0;
+}
+
+/* ---- plugin.eq_*() -- bridge straight into peq.c's public API, no gui.c
+ * layer needed (peq.c has no LVGL dependency, matching l_plugin_list_dir()/
+ * l_plugin_sd_root() already calling plain C functions directly). Every
+ * setter ends with peq_save(), the same "persist on every change" pattern
+ * every native EQ-screen event handler already follows (see e.g. gui.c's
+ * eq_bypass_switch_event_cb()), so a plugin-driven EQ change survives
+ * reboot with no new persistence code. ---- */
+
+static int l_plugin_eq_load_profile(lua_State * L) {
+    const char * path = check_plugin_external_path(L, 1, "plugin.eq_load_profile");
+    bool ok = peq_load_from_path(path);
+    if (ok) peq_save();
+    lua_pushboolean(L, ok);
+    return 1;
+}
+
+static int l_plugin_eq_save_profile(lua_State * L) {
+    const char * path = check_plugin_writable_path(L, 1, "plugin.eq_save_profile");
+    if (strlen(path) > PEQ_SAVE_PATH_MAX) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+    /* peq_save_to_path() also writes <path>.tmp and may write <path>.bak:
+     * each name must pass the same check (a symlink there could point
+     * anywhere). */
+    static const char * const suffixes[] = { ".tmp", ".bak" };
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char derived[PEQ_SAVE_PATH_MAX + 8];
+        snprintf(derived, sizeof(derived), "%s%s", path, suffixes[i]);
+        if (plugin_storage_path_is_reserved(derived))
+            return luaL_error(L, "plugin.eq_save_profile: path is reserved (player settings, plugin.storage, plugin.secrets)");
+        if (plugin_path_in_install_root(derived))
+            return luaL_error(L, "plugin.eq_save_profile: " INSTALL_ROOT_READ_ONLY);
+    }
+    lua_pushboolean(L, peq_save_to_path(path));
+    return 1;
+}
+
+static int l_plugin_eq_reset(lua_State * L) {
+    (void) L;
+    peq_reset_to_defaults();
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_bypass(lua_State * L) {
+    bool enabled = lua_toboolean(L, 1);
+    peq_set_bypass(enabled);
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_preamp(lua_State * L) {
+    double db = luaL_checknumber(L, 1);
+    peq_set_preamp_db(db);
+    peq_save();
+    return 0;
+}
+
+/* Converts a 1-based Lua band index to peq.c's 0-based one, luaL_error()ing
+ * if out of range -- same "fail loudly at call time" convention
+ * l_plugin_register_list_item() already uses for a bad list_id. */
+static int check_eq_band_index(lua_State * L, int arg) {
+    lua_Integer index = luaL_checkinteger(L, arg);
+    if (index < 1 || index > PEQ_NUM_BANDS) {
+        luaL_error(L, "band index %d out of range (expected 1..%d)", (int) index, PEQ_NUM_BANDS);
+    }
+    return (int) index - 1;
+}
+
+static int l_plugin_eq_set_band(lua_State * L) {
+    int index = check_eq_band_index(L, 1);
+    double freq_hz = luaL_checknumber(L, 2);
+    double gain_db = luaL_checknumber(L, 3);
+    double q = luaL_checknumber(L, 4);
+    peq_set_band(index, freq_hz, gain_db, q);
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_band_type(lua_State * L) {
+    int index = check_eq_band_index(L, 1);
+    const char * type = luaL_checkstring(L, 2);
+
+    peq_band_type_t t;
+    if (strcmp(type, "peaking") == 0) t = PEQ_TYPE_PEAKING;
+    else if (strcmp(type, "low_shelf") == 0) t = PEQ_TYPE_LOW_SHELF;
+    else if (strcmp(type, "high_shelf") == 0) t = PEQ_TYPE_HIGH_SHELF;
+    else return luaL_error(L, "plugin.eq_set_band_type: unknown type '%s' (expected \"peaking\", \"low_shelf\", or \"high_shelf\")", type);
+
+    peq_set_band_type(index, t);
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_band_enabled(lua_State * L) {
+    int index = check_eq_band_index(L, 1);
+    bool enabled = lua_toboolean(L, 2);
+    peq_set_band_enabled(index, enabled);
+    peq_save();
+    return 0;
+}
+
+/* Same "pure audio-domain, straight into audio.c, no gui.c bridge" shape as
+ * plugin.eq_*() above -- setting a hardware volume curve isn't paired with
+ * any gui.c-local UI state (it doesn't move the volume slider or its
+ * popup, it changes what a given slider position maps to internally), so
+ * it doesn't need one. In-process only, like every other plugin config
+ * call in this file -- not persisted, a plugin re-applies it at the top of
+ * its own script on every boot (same convention set_launcher_layout() etc.
+ * already use, see their own comments). HW_VOLUME_CURVE_LEN is audio.h's
+ * own shared definition, not a local one, so this validation can't drift
+ * out of sync with audio_set_custom_hw_volume_curve()'s actual buffer
+ * size.
+ *
+ * loading_plugin_slot >= 0 for exactly the duration of a plugin's own
+ * top-level script run (set/cleared around plugin_call() in
+ * load_plugin_file(), never true from a later callback -- a real Gain
+ * Mode plugin's Settings-list on_select handler, for instance, always
+ * runs with it back at -1). Inside that window this call is part of
+ * plugin_manager_init()'s own load transaction (which may still load more
+ * plugin files, or discard this very one if it fails on a later call),
+ * so it only stages the state change -- audio_stage_custom_hw_volume_
+ * curve(), no hardware write, and no effect on the live state
+ * audio_apply_volume() reads -- and load_plugin_file()/plugin_manager_
+ * init() own the single deferred commit (see audio.h's own comment on
+ * why an immediate write per call here would risk an intermediate value
+ * actually reaching the DAC, or surviving a later failure). Outside that
+ * window -- a live, already-loaded plugin changing its own curve --
+ * audio_set_custom_hw_volume_curve() applies it immediately instead, for
+ * real-time audible feedback. */
+static int l_plugin_set_hw_volume_curve(lua_State * L) {
+    bool during_load = loading_plugin_slot >= 0;
+
+    if (lua_isnoneornil(L, 1)) {
+        if (during_load) audio_stage_custom_hw_volume_curve(false, NULL);
+        else audio_set_custom_hw_volume_curve(NULL);
+        return 0;
+    }
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_Unsigned raw_n = lua_rawlen(L, 1);
+    if (raw_n != HW_VOLUME_CURVE_LEN)
+        return luaL_error(L, "plugin.set_hw_volume_curve: table must have exactly %d entries (UI volume 0..100), got %d",
+                           HW_VOLUME_CURVE_LEN, (int) raw_n);
+
+    uint8_t curve[HW_VOLUME_CURVE_LEN];
+    for (int i = 0; i < HW_VOLUME_CURVE_LEN; i++) {
+        lua_rawgeti(L, 1, i + 1);
+        /* lua_tointeger() alone silently converts a missing/nonnumeric/
+         * non-integral entry to 0 -- and raw 0 is the hardware's LOUDEST
+         * point (see compute_hw_raw()'s own comment in audio.c), so a
+         * malformed table (a hole, a string, a float like 128.5) could
+         * otherwise turn into an unexpected full-volume step instead of a
+         * caught error. lua_isinteger() rejects all of those before any
+         * conversion happens. */
+        if (!lua_isinteger(L, -1)) {
+            int t = lua_type(L, -1);
+            lua_pop(L, 1);
+            return luaL_error(L, "plugin.set_hw_volume_curve: table[%d] (UI volume %d%%) is not an integer (got %s)",
+                               i + 1, i, lua_typename(L, t));
+        }
+        lua_Integer v = lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        if (v < 0 || v > 255)
+            return luaL_error(L, "plugin.set_hw_volume_curve: table[%d] (UI volume %d%%) is %lld, must be 0..255",
+                               i + 1, i, (long long) v);
+        curve[i] = (uint8_t) v;
+    }
+    if (during_load) audio_stage_custom_hw_volume_curve(true, curve);
+    else audio_set_custom_hw_volume_curve(curve);
+    return 0;
+}
+
+/* ---- plugin.toggle_pause()/stop()/next_track()/prev_track()/seek()/
+ * set_volume()/is_playing()/is_paused()/get_position()/get_duration() --
+ * thin wrappers over gui.h's gui_plugin_*() bridges, needed here (unlike
+ * plugin.eq_*() above) because audio.c's own functions must be paired with
+ * gui.c-local UI state (play/pause icon, volume slider/popup, shuffle-aware
+ * stepping) -- see gui.h's own comment on gui_plugin_toggle_pause() and
+ * neighbors for why. ---- */
+
+static int l_plugin_toggle_pause(lua_State * L) {
+    (void) L;
+    gui_plugin_toggle_pause();
+    return 0;
+}
+
+static int l_plugin_stop(lua_State * L) {
+    (void) L;
+    gui_plugin_stop();
+    return 0;
+}
+
+static int l_plugin_next_track(lua_State * L) {
+    (void) L;
+    gui_plugin_next_track();
+    return 0;
+}
+
+static int l_plugin_prev_track(lua_State * L) {
+    (void) L;
+    gui_plugin_prev_track();
+    return 0;
+}
+
+static int l_plugin_seek(lua_State * L) {
+    double seconds = luaL_checknumber(L, 1);
+    gui_plugin_seek(seconds);
+    return 0;
+}
+
+static int l_plugin_set_transport_skip(lua_State * L) {
+    const char * directory = check_plugin_external_path(L, 1, "plugin.set_transport_skip");
+    lua_Integer seconds = luaL_checkinteger(L, 2);
+    if (seconds < 0 || seconds > 300) return luaL_error(L, "skip seconds must be 0..300");
+    if (strlen(directory) >= PATH_MAX) return luaL_error(L, "skip directory too long");
+    gui_player_set_transport_skip(directory, (int) seconds);
+    return 0;
+}
+
+static int l_plugin_set_volume(lua_State * L) {
+    lua_Integer percent = luaL_checkinteger(L, 1);
+    gui_plugin_set_volume((int) percent);
+    return 0;
+}
+
+static int l_plugin_is_playing(lua_State * L) {
+    lua_pushboolean(L, gui_plugin_is_playing());
+    return 1;
+}
+
+static int l_plugin_is_paused(lua_State * L) {
+    lua_pushboolean(L, gui_plugin_is_paused());
+    return 1;
+}
+
+static int l_plugin_get_position(lua_State * L) {
+    lua_pushnumber(L, gui_plugin_get_position_seconds());
+    return 1;
+}
+
+static int l_plugin_get_duration(lua_State * L) {
+    lua_pushnumber(L, gui_plugin_get_duration_seconds());
+    return 1;
+}
+
+typedef struct {
+    int level;
+    bool charging;
+    bool full;
+    bool external_power;
+} plugin_battery_info_t;
+
+static plugin_battery_info_t plugin_read_battery_info(void) {
+    plugin_battery_info_t info;
+    int level = battery_get_display_percent(); /* same value the status bar shows */
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+    battery_external_power_state_t power_state = battery_get_external_power_state();
+    bool power_disconnected = power_state == BATTERY_EXTERNAL_POWER_DISCONNECTED;
+    bool capped = charge_control_is_confirmed_off();
+    info.level = level;
+    info.external_power = power_state == BATTERY_EXTERNAL_POWER_CONNECTED;
+    info.full = !power_disconnected && (battery_is_full() || capped);
+    info.charging = !info.full && !power_disconnected && battery_is_charging();
+    return info;
+}
+
+static void push_battery_info(lua_State * L, const plugin_battery_info_t * info) {
+    lua_newtable(L);
+    lua_pushinteger(L, info->level); lua_setfield(L, -2, "level");
+    lua_pushboolean(L, info->charging); lua_setfield(L, -2, "charging");
+    lua_pushboolean(L, info->full); lua_setfield(L, -2, "full");
+    lua_pushboolean(L, info->external_power); lua_setfield(L, -2, "external_power");
+}
+
+static int current_volume_percent(void) {
+    int percent = (int) (audio_get_volume() * 100.0f + 0.5f);
+    if (percent < 0) return 0;
+    if (percent > 100) return 100;
+    return percent;
+}
+
+static int l_plugin_get_volume(lua_State * L) {
+    lua_pushinteger(L, current_volume_percent());
+    return 1;
+}
+
+static int l_plugin_get_battery(lua_State * L) {
+    plugin_battery_info_t info = plugin_read_battery_info();
+    push_battery_info(L, &info);
+    return 1;
+}
+
+/* plugin.http_get(url [, verify_tls]) -> status, body | nil, "network error"
+ * -- bridges http_client.c's http_get_to_buffer() directly (no gui.c layer,
+ * same reasoning as plugin.eq_*() above: no LVGL/gui-state dependency).
+ * body is pushed with lua_pushlstring() (exact byte count), not
+ * lua_pushstring(), since a response body isn't guaranteed NUL-free. Runs
+ * synchronously on the calling (main UI) thread -- see this file's own
+ * top-of-file doc comment for the blocking caveat. */
+static int l_plugin_http_get(lua_State * L) {
+    const char * url = luaL_checkstring(L, 1);
+    bool verify_tls = lua_gettop(L) >= 2 ? lua_toboolean(L, 2) : true;
+
+    int status = 0;
+    uint8_t * body = NULL;
+    size_t body_size = 0;
+    bool ok = http_get_to_buffer(url, verify_tls, &status, &body, &body_size);
+    if (!ok) {
+        return push_plugin_error(L, "network error");
+    }
+
+    lua_pushinteger(L, status);
+    lua_pushlstring(L, (const char *) body, body_size);
+    free(body);
+    return 2;
+}
+
+/* plugin.http_post(url, body [, content_type] [, verify_tls]) -> status,
+ * body | nil, "network error" -- same contract/shape as l_plugin_http_get()
+ * above, bridging http_client.c's new http_post_to_buffer(). body is read
+ * with luaL_checklstring() (not luaL_checkstring()) since a POST body isn't
+ * guaranteed NUL-free either (e.g. a binary payload), same reasoning as the
+ * response body's own lua_pushlstring() below. content_type defaults to
+ * "application/x-www-form-urlencoded" (what most simple API POSTs,
+ * including Last.fm's, expect) when omitted or nil. */
+static int l_plugin_http_post(lua_State * L) {
+    const char * url = luaL_checkstring(L, 1);
+    size_t body_len = 0;
+    const char * body = luaL_checklstring(L, 2, &body_len);
+    const char * content_type =
+        (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) ? luaL_checkstring(L, 3) : "application/x-www-form-urlencoded";
+    bool verify_tls = lua_gettop(L) >= 4 ? lua_toboolean(L, 4) : true;
+
+    int status = 0;
+    uint8_t * resp_body = NULL;
+    size_t resp_body_size = 0;
+    bool ok = http_post_to_buffer(url, verify_tls, content_type, (const uint8_t *) body, body_len, &status,
+                                   &resp_body, &resp_body_size);
+    if (!ok) {
+        return push_plugin_error(L, "network error");
+    }
+
+    lua_pushinteger(L, status);
+    lua_pushlstring(L, (const char *) resp_body, resp_body_size);
+    free(resp_body);
+    return 2;
+}
+
+typedef struct {
+    bool active;
+    atomic_bool done;
+    /* Token tracking cancellation state and allowing socket interrupt via shutdown(). */
+    http_cancel_token_t cancel;
+    uint16_t generation;
+    pthread_t thread;
+    lua_State * L;
+    int callback_ref;
+    bool is_download;
+    char dest_path[PATH_MAX]; /* download only */
+    bool verify_tls;
+
+    char url[2048];
+    http_method_t method;
+    http_header_t headers[HTTP_MAX_HEADERS];
+    int header_count;
+    /* The one header value longer than a slot, owned (heap), or NULL. */
+    char long_header_name[HTTP_HEADER_NAME_MAX];
+    char * long_header_value;
+    uint8_t * request_body;
+    size_t request_body_size;
+    char content_type[128];
+    size_t max_response_size;
+    uint32_t connect_timeout_ms;
+    uint32_t read_timeout_ms;
+    uint32_t total_timeout_ms;
+    int redirect_limit;
+
+    /* Result fields -- the plain-request path (below) populates all of
+     * these; the download path only ever uses `ok`/dest_path. */
+    bool ok;
+    int status;
+    uint8_t * response_body;
+    size_t response_body_size;
+    http_header_t response_headers[HTTP_MAX_HEADERS];
+    int response_header_count;
+    const char * response_error; /* one of http_client.h's HTTP_ERR_* constants -- a stable static string, never malloc'd/freed */
+} plugin_async_http_t;
+
+static plugin_async_http_t plugin_async_http[PLUGIN_MAX_ASYNC_HTTP];
+
+static bool plugin_async_download_progress(uint64_t downloaded, uint64_t total, void * user_data) {
+    (void) downloaded;
+    (void) total;
+    plugin_async_http_t * req = (plugin_async_http_t *) user_data;
+    return !http_cancel_token_is_cancelled(&req->cancel);
+}
+
+/* Collapses headers in place so only the last occurrence of each case-insensitive
+ * header name is retained when passed to Lua callbacks. */
+static void plugin_dedupe_headers_case_insensitive(http_header_t * headers, int * count) {
+    int out = 0;
+    for (int i = 0; i < *count; i++) {
+        bool superseded = false;
+        for (int j = i + 1; j < *count; j++) {
+            if (strcasecmp(headers[i].name, headers[j].name) == 0) { superseded = true; break; }
+        }
+        if (superseded) continue;
+        if (out != i) headers[out] = headers[i];
+        out++;
+    }
+    *count = out;
+}
+
+static void * plugin_async_http_thread_func(void * arg) {
+    plugin_async_http_t * req = (plugin_async_http_t *) arg;
+    if (req->is_download) {
+        char temp_path[PATH_MAX];
+        /* Defense in depth: l_plugin_download_file_async() already
+         * rejected a reserved dest_path before ever starting this thread,
+         * but re-check here too, immediately before touching the
+         * filesystem, rather than trusting that the only path into this
+         * branch is the one already-guarded call site -- the same
+         * discipline this codebase already applies to bounds/validity
+         * checks that matter (re-verify at the point of use, not just at
+         * the call site three frames up). Must NOT return early here --
+         * req->done still needs to be set below, via the function's
+         * normal shared tail, or plugin_manager_poll() would never reap
+         * this slot and it would leak permanently as "active". */
+        int n;
+        if (plugin_storage_path_is_reserved(req->dest_path)) {
+            n = -1; /* forces the "invalid" branch below without touching the filesystem */
+        } else {
+            n = snprintf(temp_path, sizeof(temp_path), "%s.part.XXXXXX", req->dest_path);
+        }
+        if (n <= 0 || (size_t) n >= sizeof(temp_path)) {
+            req->ok = false;
+        } else {
+            int fd = mkstemp(temp_path);
+            if (fd < 0) {
+                req->ok = false;
+            } else {
+                close(fd);
+                /* Review finding: http_get_to_file() had no size bound at
+                 * all for its file-sink write path -- http_get_to_file_
+                 * bounded() (0 = a generous 2 GiB built-in default) closes
+                 * that gap for plugin-driven downloads specifically,
+                 * without touching http_get_to_file() itself (DLNA/cover-
+                 * art downloads keep their original unlimited behavior). */
+                req->ok = http_get_to_file_bounded(req->url, req->verify_tls, temp_path, 0,
+                                                    plugin_async_download_progress, req);
+                bool cancelled = http_cancel_token_is_cancelled(&req->cancel);
+                if (req->ok && !cancelled) {
+                    req->ok = rename(temp_path, req->dest_path) == 0;
+                }
+                if (!req->ok || cancelled) remove(temp_path);
+            }
+        }
+    } else {
+        /* plugin.http_request()'s plain (non-download) path -- shares the
+         * extended http_request_ex() (headers, methods beyond GET/POST,
+         * timeouts, redirects, response headers, real cancellation) with
+         * the future authenticated audio-stream reader, per this app's
+         * own remote-provider design (see http_client.h's own comment on
+         * why this is separate, new code rather than a rework of the
+         * do_get()/do_post()-based functions used elsewhere). */
+        http_request_t hreq;
+        memset(&hreq, 0, sizeof(hreq));
+        snprintf(hreq.url, sizeof(hreq.url), "%s", req->url);
+        hreq.method = req->method;
+        memcpy(hreq.headers, req->headers, sizeof(hreq.headers));
+        hreq.header_count = req->header_count;
+        if (req->long_header_value) {
+            memcpy(hreq.long_header_name, req->long_header_name, sizeof(hreq.long_header_name));
+            hreq.long_header_value = req->long_header_value;
+        }
+        /* Backward-compat note: the OLD GET path (http_get_to_buffer_
+         * limited()) never received request_body at all -- a plugin's
+         * "body" field was parsed and allocated regardless of method, but
+         * silently dropped (never sent, never even passed to the GET
+         * function) unless method was POST. Likewise, do_get() never
+         * built a Content-Type header into the request either, even
+         * though the Lua-facing content_type field already defaulted to a
+         * non-empty string regardless of method. Preserve BOTH exactly:
+         * only pass body and content_type through for methods that
+         * conventionally carry one, so an existing GET-only plugin's
+         * request is byte-for-byte the same on the wire as before -- not
+         * a new (harmless to most servers, but still a real behavior
+         * change) body/Content-Length/Content-Type appearing on a GET for
+         * the first time just because the field happened to be set. */
+        bool method_has_body = req->method == HTTP_METHOD_POST || req->method == HTTP_METHOD_PUT ||
+                                req->method == HTTP_METHOD_PATCH;
+        hreq.body = method_has_body ? req->request_body : NULL;
+        hreq.body_len = method_has_body ? req->request_body_size : 0;
+        hreq.content_type = (method_has_body && req->content_type[0]) ? req->content_type : NULL;
+        hreq.verify_tls = req->verify_tls;
+        hreq.connect_timeout_ms = req->connect_timeout_ms;
+        hreq.read_timeout_ms = req->read_timeout_ms;
+        hreq.total_timeout_ms = req->total_timeout_ms;
+        hreq.max_response_bytes = req->max_response_size;
+        hreq.redirect_limit = req->redirect_limit;
+
+        http_response_t hresp;
+        req->ok = http_request_ex(&hreq, &req->cancel, &hresp);
+        req->status = hresp.status;
+        req->response_body = hresp.body; /* ownership transferred -- do NOT http_response_free() this; freed via plugin_manager_poll()'s existing free(req->response_body) */
+        req->response_body_size = hresp.body_len;
+        memcpy(req->response_headers, hresp.headers, sizeof(req->response_headers));
+        req->response_header_count = hresp.header_count;
+        plugin_dedupe_headers_case_insensitive(req->response_headers, &req->response_header_count);
+        req->response_error = hresp.error;
+    }
+    free(req->request_body);
+    req->request_body = NULL;
+    req->request_body_size = 0;
+    free(req->long_header_value);
+    req->long_header_value = NULL;
+    atomic_store(&req->done, true);
+    return NULL;
+}
+
+/* plugin.http_request(options, callback) -> handle | nil, error. Network
+ * work happens on a native worker and the callback is invoked only later
+ * by plugin_manager_poll() on the UI/Lua thread.
+ *
+ * callback(status, body, error, headers): the ORIGINAL 3-arg shape
+ * (status, body, error) is preserved exactly -- an existing plugin whose
+ * callback function only declares 3 parameters is completely unaffected,
+ * since Lua silently drops extra arguments a function doesn't declare.
+ * `headers` is new: a plain {name = value} map of the response's headers
+ * (case as the server sent it; look it up case-insensitively yourself if
+ * needed, e.g. via a small helper, since Lua table keys are exact-match).
+ * A repeated header name keeps only the LAST occurrence in this map --
+ * a deliberate simplification, documented in docs/PLUGINS.md.
+ *
+ * New optional `options` fields, all backward compatible (every one
+ * defaults to matching the exact previous behavior when omitted):
+ * - method: now also accepts "PUT"/"PATCH"/"DELETE"/"HEAD", not just
+ *   GET/POST.
+ * - headers = {Name = "value", ...}: arbitrary request headers.
+ * - connect_timeout_ms / read_timeout_ms / total_timeout_ms: 0 (default)
+ *   means no timeout, exactly like every request before this existed.
+ * - redirect_limit: 0 (default) means don't follow redirects -- a 3xx
+ *   itself is returned as an ordinary result (status 3xx, no error),
+ *   matching what happened before redirect-following existed at all
+ *   (do_get()/do_post() never looked at Location either). */
+static int l_plugin_http_request(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    int slot = -1;
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        if (!plugin_async_http[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        return push_plugin_error(L, "too many active HTTP requests");
+    }
+
+    lua_getfield(L, 1, "url");
+    const char * url = luaL_checkstring(L, -1);
+    if (strlen(url) >= sizeof(plugin_async_http[slot].url)) {
+        return luaL_error(L, "plugin.http_request: URL is too long");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "method");
+    const char * method_str = luaL_optstring(L, -1, "GET");
+    http_method_t method;
+    if (strcasecmp(method_str, "GET") == 0) method = HTTP_METHOD_GET;
+    else if (strcasecmp(method_str, "POST") == 0) method = HTTP_METHOD_POST;
+    else if (strcasecmp(method_str, "PUT") == 0) method = HTTP_METHOD_PUT;
+    else if (strcasecmp(method_str, "PATCH") == 0) method = HTTP_METHOD_PATCH;
+    else if (strcasecmp(method_str, "DELETE") == 0) method = HTTP_METHOD_DELETE;
+    else if (strcasecmp(method_str, "HEAD") == 0) method = HTTP_METHOD_HEAD;
+    else return luaL_error(L, "plugin.http_request: unknown method '%s'", method_str);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "body");
+    size_t body_size = 0;
+    const char * body = lua_isnil(L, -1) ? NULL : luaL_checklstring(L, -1, &body_size);
+    if (body_size > PLUGIN_ASYNC_HTTP_MAX_REQUEST) {
+        return luaL_error(L, "plugin.http_request: request body exceeds %u bytes", PLUGIN_ASYNC_HTTP_MAX_REQUEST);
+    }
+    uint8_t * body_copy = NULL;
+    if (body_size > 0) {
+        body_copy = malloc(body_size);
+        if (!body_copy) return luaL_error(L, "plugin.http_request: out of memory");
+        memcpy(body_copy, body, body_size);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "content_type");
+    const char * content_type = luaL_optstring(L, -1, "application/x-www-form-urlencoded");
+    if (strlen(content_type) >= sizeof(plugin_async_http[slot].content_type)) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: content_type is too long");
+    }
+    lua_pop(L, 1);
+
+    /* Arbitrary request headers -- {Name = "value", ...}, bounded to
+     * HTTP_MAX_HEADERS entries and HTTP_HEADER_NAME_MAX/VALUE_MAX per
+     * entry (silently truncated past that, same as content_type/url
+     * above being length-checked rather than ever overflowing). */
+    http_header_t headers[HTTP_MAX_HEADERS];
+    int header_count = 0;
+    /* One value may exceed a slot (a long bearer token); see
+     * HTTP_LONG_HEADER_VALUE_MAX in http_client.h. The Lua string stays
+     * reachable through options.headers for this whole call, so it is only
+     * copied to the heap after the last call below that can raise. */
+    char long_header_name[HTTP_HEADER_NAME_MAX] = "";
+    const char * long_value_src = NULL;
+    size_t long_value_len = 0;
+    lua_getfield(L, 1, "headers");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        /* Every entry is visited: more than HTTP_MAX_HEADERS short headers
+         * (or a second long one) is an error, never a silently dropped
+         * header whose fate depends on table traversal order. */
+        while (lua_next(L, -2) != 0) {
+            if (lua_type(L, -2) == LUA_TSTRING) {
+                /* Review finding: snprintf() alone silently truncated an
+                 * oversized name/value, and validation afterward (the
+                 * CRLF/invalid-character check further down this
+                 * function) then validated the TRUNCATED copy, not what
+                 * the plugin actually passed -- a header could silently
+                 * become a different, shorter one on the wire instead of
+                 * failing loudly. Check the real length (via
+                 * lua_tolstring(), which also catches an embedded NUL a
+                 * plain lua_tostring()+strlen() would miss) and reject
+                 * with a clear Lua error, exactly like an oversized
+                 * url/content_type already does elsewhere in this
+                 * function, instead of truncating. */
+                size_t name_len = 0, value_len = 0;
+                const char * name = lua_tolstring(L, -2, &name_len);
+                const char * value = lua_tolstring(L, -1, &value_len); /* non-string values (numbers) still convert fine via lua_tolstring */
+                if (name && value) {
+                    bool long_value = value_len >= sizeof(headers[0].value);
+                    if (strlen(name) != name_len || strlen(value) != value_len) {
+                        free(body_copy);
+                        return luaL_error(L, "plugin.http_request: header '%s' contains a NUL byte", name);
+                    }
+                    if (name_len >= sizeof(headers[0].name) ||
+                        (long_value && (long_value_src || value_len >= HTTP_LONG_HEADER_VALUE_MAX ||
+                                        lua_type(L, -1) != LUA_TSTRING))) {
+                        free(body_copy);
+                        return luaL_error(L, "plugin.http_request: header '%s' name/value exceeds %d/%d bytes "
+                                          "(one value may be up to %d)",
+                                          name, (int) sizeof(headers[0].name) - 1, (int) sizeof(headers[0].value) - 1,
+                                          HTTP_LONG_HEADER_VALUE_MAX - 1);
+                    }
+                    if (!long_value && header_count >= HTTP_MAX_HEADERS) {
+                        free(body_copy);
+                        return luaL_error(L, "plugin.http_request: at most %d headers", HTTP_MAX_HEADERS);
+                    }
+                    if (long_value) {
+                        long_value_src = value;
+                        long_value_len = value_len;
+                        memcpy(long_header_name, name, name_len + 1);
+                    } else {
+                        memcpy(headers[header_count].name, name, name_len + 1);
+                        memcpy(headers[header_count].value, value, value_len + 1);
+                        header_count++;
+                    }
+                }
+            }
+            lua_pop(L, 1); /* pop value, keep key for lua_next */
+        }
+    }
+    /* The long value itself is pushed and stays on the stack until the call
+     * returns: a later options metamethod could remove it from the headers
+     * table and collect it, so the table alone does not keep it alive. */
+    if (long_value_src) {
+        lua_pushstring(L, long_header_name);
+        lua_rawget(L, -2);
+        size_t len = 0;
+        long_value_src = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &len) : NULL;
+        if (!long_value_src || len != long_value_len) {
+            free(body_copy);
+            return luaL_error(L, "plugin.http_request: header '%s' changed while reading", long_header_name);
+        }
+    }
+
+    lua_getfield(L, 1, "verify_tls");
+    bool verify_tls = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "max_response_bytes");
+    lua_Integer requested_max = luaL_optinteger(L, -1, PLUGIN_ASYNC_HTTP_DEFAULT_MAX);
+    lua_pop(L, 1);
+    if (requested_max < 1 || requested_max > PLUGIN_ASYNC_HTTP_MAX_RESPONSE) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: max_response_bytes must be 1..%u",
+                          PLUGIN_ASYNC_HTTP_MAX_RESPONSE);
+    }
+
+    lua_getfield(L, 1, "connect_timeout_ms");
+    lua_Integer connect_timeout_ms = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "read_timeout_ms");
+    lua_Integer read_timeout_ms = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "total_timeout_ms");
+    lua_Integer total_timeout_ms = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "redirect_limit");
+    lua_Integer redirect_limit = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    if (connect_timeout_ms < 0 || read_timeout_ms < 0 || total_timeout_ms < 0 || redirect_limit < 0) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: timeout/redirect_limit fields must not be negative");
+    }
+    /* Review finding: values were only checked for being non-negative,
+     * then narrowed to uint32_t/int with no upper bound at all. A
+     * timeout above UINT32_MAX would wrap; more seriously, a value
+     * between INT_MAX+1 and UINT32_MAX becomes NEGATIVE once narrowed to
+     * the plain int poll() itself takes, which poll() treats as "wait
+     * indefinitely" -- the opposite of what a timeout is for. An
+     * enormous redirect_limit could also drive the redirect-following
+     * recursion deep enough to exhaust the C stack. Reject outright
+     * rather than silently clamp/truncate, so a plugin passing a garbage
+     * value finds out immediately, not via mysterious hangs later. These
+     * limits match http_client.c's own separate, defensive caps
+     * (HTTP_REQUEST_MAX_TIMEOUT_MS/HTTP_REQUEST_MAX_REDIRECTS) -- kept as
+     * two independent checks deliberately (belt and suspenders), not
+     * because either alone would be insufficient. */
+#define PLUGIN_HTTP_MAX_TIMEOUT_MS (5 * 60 * 1000) /* 5 minutes */
+#define PLUGIN_HTTP_MAX_REDIRECTS 10
+    if (connect_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS || read_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS ||
+        total_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: connect_timeout_ms/read_timeout_ms/total_timeout_ms must not exceed %d",
+                          PLUGIN_HTTP_MAX_TIMEOUT_MS);
+    }
+    if (redirect_limit > PLUGIN_HTTP_MAX_REDIRECTS) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: redirect_limit must not exceed %d", PLUGIN_HTTP_MAX_REDIRECTS);
+    }
+
+    /* Registered before anything native is allocated or the slot is
+     * claimed: luaL_ref() can raise. */
+    lua_pushvalue(L, 2);
+    int callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    char * long_header_value = NULL;
+    if (long_value_src) {
+        long_header_value = malloc(long_value_len + 1);
+        if (!long_header_value) {
+            luaL_unref(L, LUA_REGISTRYINDEX, callback_ref);
+            free(body_copy);
+            return push_plugin_error(L, "out of memory");
+        }
+        memcpy(long_header_value, long_value_src, long_value_len + 1);
+    }
+
+    plugin_async_http_t * req = &plugin_async_http[slot];
+    uint16_t generation = (uint16_t) (req->generation + 1);
+    if (generation == 0) generation = 1;
+    memset(req, 0, sizeof(*req));
+    atomic_init(&req->done, false);
+    http_cancel_token_init(&req->cancel);
+    req->generation = generation;
+    req->active = true;
+    req->L = plugin_main_state(L);
+    req->method = method;
+    memcpy(req->headers, headers, sizeof(req->headers));
+    req->header_count = header_count;
+    memcpy(req->long_header_name, long_header_name, sizeof(req->long_header_name));
+    req->long_header_value = long_header_value;
+    req->verify_tls = verify_tls;
+    req->request_body = body_copy;
+    req->request_body_size = body_size;
+    req->max_response_size = (size_t) requested_max;
+    req->connect_timeout_ms = (uint32_t) connect_timeout_ms;
+    req->read_timeout_ms = (uint32_t) read_timeout_ms;
+    req->total_timeout_ms = (uint32_t) total_timeout_ms;
+    req->redirect_limit = (int) redirect_limit;
+    snprintf(req->url, sizeof(req->url), "%s", url);
+    snprintf(req->content_type, sizeof(req->content_type), "%s", content_type);
+    req->callback_ref = callback_ref;
+
+    if (pthread_create(&req->thread, NULL, plugin_async_http_thread_func, req) != 0) {
+        luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
+        free(req->request_body);
+        req->request_body = NULL;
+        free(req->long_header_value);
+        req->long_header_value = NULL;
+        req->active = false;
+        http_cancel_token_destroy(&req->cancel);
+        return push_plugin_error(L, "could not start HTTP worker");
+    }
+
+    int handle = ((int) generation << 8) | (slot + 1);
+    lua_pushinteger(L, handle);
+    return 1;
+}
+
+/* plugin.download_file_async(url, dest_path [, verify_tls], callback)
+ * -> handle | nil, error. Streams into a unique sibling temporary file on
+ * the native HTTP worker, then atomically renames it over dest_path only
+ * after a complete 2xx response. callback(dest_path, error) runs later on
+ * the Lua/UI thread, matching http_request's callback discipline. */
+static int l_plugin_download_file_async(lua_State * L) {
+    const char * url = luaL_checkstring(L, 1);
+    const char * dest_path = luaL_checkstring(L, 2);
+    int callback_index = lua_isfunction(L, 3) ? 3 : 4;
+    bool verify_tls = callback_index == 3 ? true : lua_toboolean(L, 3);
+    luaL_checktype(L, callback_index, LUA_TFUNCTION);
+
+    if (strlen(url) >= sizeof(plugin_async_http[0].url))
+        return luaL_error(L, "plugin.download_file_async: URL is too long");
+    if (dest_path[0] == '\0' || strlen(dest_path) >= sizeof(plugin_async_http[0].dest_path) - 12)
+        return luaL_error(L, "plugin.download_file_async: destination path is invalid or too long");
+    if (plugin_storage_path_is_reserved(dest_path))
+        return luaL_error(L, "plugin.download_file_async: path is reserved (player settings, plugin.storage, plugin.secrets)");
+    if (plugin_path_in_install_root(dest_path))
+        return luaL_error(L, "plugin.download_file_async: " INSTALL_ROOT_READ_ONLY);
+
+    int slot = -1;
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        if (!plugin_async_http[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        return push_plugin_error(L, "too many active HTTP requests");
+    }
+
+    plugin_async_http_t * req = &plugin_async_http[slot];
+    uint16_t generation = (uint16_t) (req->generation + 1);
+    if (generation == 0) generation = 1;
+    memset(req, 0, sizeof(*req));
+    atomic_init(&req->done, false);
+    http_cancel_token_init(&req->cancel);
+    req->generation = generation;
+    req->active = true;
+    req->L = plugin_main_state(L);
+    req->is_download = true;
+    req->verify_tls = verify_tls;
+    snprintf(req->url, sizeof(req->url), "%s", url);
+    snprintf(req->dest_path, sizeof(req->dest_path), "%s", dest_path);
+    lua_pushvalue(L, callback_index);
+    req->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    if (pthread_create(&req->thread, NULL, plugin_async_http_thread_func, req) != 0) {
+        luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
+        req->active = false;
+        http_cancel_token_destroy(&req->cancel);
+        return push_plugin_error(L, "could not start HTTP worker");
+    }
+
+    lua_pushinteger(L, ((int) generation << 8) | (slot + 1));
+    return 1;
+}
+
+static int l_plugin_cancel(lua_State * L) {
+    int handle = (int) luaL_checkinteger(L, 1);
+    int slot = (handle & 0xFF) - 1;
+    uint16_t generation = (uint16_t) ((unsigned int) handle >> 8);
+    bool cancelled = false;
+    if (slot >= 0 && slot < PLUGIN_MAX_ASYNC_HTTP) {
+        plugin_async_http_t * req = &plugin_async_http[slot];
+        if (req->active && req->generation == generation) {
+            /* Real cancellation now, not just callback suppression --
+             * http_cancel_token_cancel() shuts down the connection's fd,
+             * forcing a blocked connect()/recv() to return immediately
+             * (see http_client.h's own comment on http_cancel_token_t). */
+            http_cancel_token_cancel(&req->cancel);
+            cancelled = true;
+        }
+    }
+    lua_pushboolean(L, cancelled);
+    return 1;
+}
+
+/* plugin.md5(text) -> lowercase hex string -- thin wrapper around
+ * mbedtls_md5(), already vendored and already used exactly this way in
+ * subsonic_client.c's own token-auth code, so no new dependency. Needed for
+ * Last.fm's api_sig signing scheme (md5(sorted params + shared secret)),
+ * and generically useful beyond that. */
+static int l_plugin_md5(lua_State * L) {
+    size_t len = 0;
+    const char * data = luaL_checklstring(L, 1, &len);
+
+    unsigned char digest[16];
+    mbedtls_md5((const unsigned char *) data, len, digest);
+
+    char hex[33];
+    md5_digest_to_hex(digest, hex);
+    lua_pushstring(L, hex);
+    return 1;
+}
+
+/* The single pending plugin.show_text_input() call's on_submit function --
+ * show_text_entry() (gui.c) is itself a true singleton screen. A second
+ * plugin request now returns "text input busy" rather than overwriting this
+ * callback, and Back explicitly releases it. on_submit only fires on a T9
+ * keypad Enter, never on the screen's own back button. Documented in
+ * docs/PLUGINS.md rather than engineered away, matching this codebase's existing
+ * tolerance for show_list()'s own analogous single-ref caveat. */
+static lua_State * pending_text_input_L = NULL;
+static int pending_text_input_ref = LUA_NOREF;
+
+static int l_plugin_show_text_input(lua_State * L) {
+    const char * title = luaL_checkstring(L, 1);
+    const char * initial_text = (lua_gettop(L) >= 2 && !lua_isnil(L, 2)) ? luaL_checkstring(L, 2) : NULL;
+    bool is_password = lua_toboolean(L, 3);
+    luaL_checktype(L, 4, LUA_TFUNCTION);
+
+    if (pending_text_input_L && pending_text_input_ref != LUA_NOREF) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "text input busy");
+        return 2;
+    }
+    lua_pushvalue(L, 4);
+    pending_text_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    pending_text_input_L = plugin_main_state(L);
+
+    gui_plugin_show_text_input(title, initial_text, is_password);
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+/* plugin.get_now_playing() -> title, artist, album, duration_seconds, or a
+ * single nil if nothing is loaded -- pull accessor for anything that isn't
+ * reacting to the "track_started" event directly (e.g. a set_interval()
+ * tick double-checking what's still playing). Backed by gui.c's own cached
+ * now-playing globals, populated at the same two call sites that fire
+ * "track_started" -- see gui_plugin_get_now_playing()'s own comment. */
+static int l_plugin_get_now_playing(lua_State * L) {
+    char title[128], artist[128], album[128];
+    double duration_seconds = 0.0;
+    if (!gui_plugin_get_now_playing(title, sizeof(title), artist, sizeof(artist), album, sizeof(album),
+                                     &duration_seconds)) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushstring(L, title);
+    lua_pushstring(L, artist);
+    lua_pushstring(L, album);
+    lua_pushnumber(L, duration_seconds);
+    return 4;
+}
+
+/* plugin.get_play_mode() -> "sequential" | "repeat_all" | "repeat_one" |
+ * "shuffle" -- thin wrap of gui_plugin_get_play_mode(), same "no gui-state
+ * code in this file" boundary as is_playing()/get_position() above. */
+static int l_plugin_get_play_mode(lua_State * L) {
+    lua_pushstring(L, gui_plugin_get_play_mode());
+    return 1;
+}
+
+/* plugin.get_current_track_path() -> path | nil, if nothing is loaded. */
+static int l_plugin_get_current_track_path(lua_State * L) {
+    const char * path = gui_plugin_get_current_track_path();
+    if (!path) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushstring(L, path);
+    return 1;
+}
+
+/* Shared tail for get_artist_albums()/get_album_tracks()/
+ * get_next_album_tracks() below -- pushes a malloc'd gui_plugin_* string
+ * array as a 1-indexed Lua table (or nil if it came back empty/NULL) and
+ * frees the C array, since nothing on the Lua side needs it once copied in. */
+static int push_string_array_result(lua_State * L, char ** items, int count) {
+    if (!items || count <= 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_newtable(L);
+    for (int i = 0; i < count; i++) {
+        lua_pushstring(L, items[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    gui_plugin_free_string_array(items, count);
+    return 1;
+}
+
+/* plugin.get_artist_albums(artist) -> { album_name, ... } | nil */
+static int l_plugin_get_artist_albums(lua_State * L) {
+    const char * artist = luaL_checkstring(L, 1);
+    int count = 0;
+    char ** albums = gui_plugin_get_artist_albums(artist, &count);
+    return push_string_array_result(L, albums, count);
+}
+
+/* plugin.get_album_tracks(artist, album) -> { track_path, ... } | nil */
+static int l_plugin_get_album_tracks(lua_State * L) {
+    const char * artist = luaL_checkstring(L, 1);
+    const char * album = luaL_checkstring(L, 2);
+    int count = 0;
+    char ** tracks = gui_plugin_get_album_tracks(artist, album, &count);
+    return push_string_array_result(L, tracks, count);
+}
+
+/* plugin.get_next_album_tracks(artist, current_album) -> { track_path, ... }
+ * | nil -- nil both when current_album isn't found and when it's the
+ * artist's last album (see gui_plugin_get_next_album_tracks()'s own
+ * comment: no wraparound). */
+static int l_plugin_get_next_album_tracks(lua_State * L) {
+    const char * artist = luaL_checkstring(L, 1);
+    const char * current_album = luaL_checkstring(L, 2);
+    int count = 0;
+    char ** tracks = gui_plugin_get_next_album_tracks(artist, current_album, &count);
+    return push_string_array_result(L, tracks, count);
+}
+
+/* ---- plugin.playlist_* -- CRUD over .m3u playlists under PLAYLISTS_DIR,
+ * exactly where the native Playlists screen looks. playlist_create()/
+ * playlist_delete() also update metadata_db's playlist-existence cache
+ * (metadata_db_playlist_insert_one()/_delete_one(), reachable here via
+ * gui.h's own #include "metadata_db.h") so a plugin-created/deleted
+ * playlist shows up/disappears there immediately instead of needing a full
+ * rescan -- matching every native call site (gui.c's own
+ * add_to_playlist_confirm_cb()/playlist_delete_row_cb() and friends).
+ * playlist_add()/playlist_remove() only edit a playlist's contents, which
+ * that cache never tracks (confirmed against every native call site doing
+ * the same), so they call playlist_files_append()/_remove() alone. ---- */
+
+static bool plugin_playlist_name_valid(const char * name) {
+    if (!name || !name[0] || strlen(name) > 200 || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+    for (const unsigned char * p = (const unsigned char *) name; *p; p++)
+        if (*p < 0x20 || *p == 0x7f || *p == '/' || *p == '\\') return false;
+    return true;
+}
+
+/* Plugin playlist CRUD is deliberately narrower than the native helpers:
+ * only direct .m3u/.m3u8 children returned by playlist_list() are accepted.
+ * realpath() on both the root and existing target also closes symlink
+ * escapes, rather than relying on a lexical "starts with" check. */
+static bool plugin_playlist_path_valid(const char * path) {
+    if (!path || plugin_storage_path_is_reserved(path)) return false;
+    char root_real[PATH_MAX], path_real[PATH_MAX];
+    if (!realpath(PLAYLISTS_DIR, root_real) || !realpath(path, path_real)) return false;
+    size_t root_len = strlen(root_real);
+    if (strncmp(path_real, root_real, root_len) != 0 || path_real[root_len] != '/') return false;
+    const char * base = path_real + root_len + 1;
+    if (!base[0] || strchr(base, '/')) return false;
+    const char * ext = strrchr(base, '.');
+    if (!ext || (strcasecmp(ext, ".m3u") != 0 && strcasecmp(ext, ".m3u8") != 0)) return false;
+    struct stat st;
+    return stat(path_real, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool plugin_song_path_valid(const char * path) {
+    if (!path || plugin_storage_path_is_reserved(path)) return false;
+    char root_real[PATH_MAX], path_real[PATH_MAX];
+    if (!realpath(MUSIC_ROOT_DIR, root_real) || !realpath(path, path_real)) return false;
+    size_t root_len = strlen(root_real);
+    if (strncmp(path_real, root_real, root_len) != 0 || path_real[root_len] != '/') return false;
+    struct stat st;
+    return stat(path_real, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int push_plugin_error(lua_State * L, const char * message) {
+    lua_pushnil(L);
+    lua_pushstring(L, message);
+    return 2;
+}
+
+/* plugin.playlist_list() -> { m3u_path, ... } | nil */
+static int l_plugin_playlist_list(lua_State * L) {
+    char ** paths = NULL;
+    int count = 0;
+    if (!playlist_files_scan(PLAYLISTS_DIR, &paths, &count)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_string_array_result(L, paths, count);
+}
+
+/* plugin.playlist_read(m3u_path) -> { song_path, ... } | nil */
+static int l_plugin_playlist_read(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "playlist path must be an existing .m3u file in the SD Playlists folder");
+    char ** paths = NULL;
+    int count = 0;
+    if (!playlist_files_read(m3u_path, &paths, &count)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_string_array_result(L, paths, count);
+}
+
+/* plugin.playlist_create(name, song_path) -> m3u_path | nil */
+static int l_plugin_playlist_create(lua_State * L) {
+    const char * name = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+
+    if (!plugin_playlist_name_valid(name)) return push_plugin_error(L, "invalid playlist name");
+    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "song path must be an existing file on the SD card");
+
+    char created_path[512];
+    if (!playlist_files_create(PLAYLISTS_DIR, name, song_path, created_path, sizeof(created_path))) {
+        return push_plugin_error(L, errno == EEXIST ? "playlist already exists" : "could not create playlist");
+    }
+    metadata_db_playlist_insert_one(created_path);
+    lua_pushstring(L, created_path);
+    return 1;
+}
+
+/* plugin.playlist_add(m3u_path, song_path) -> bool */
+static int l_plugin_playlist_add(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
+    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "invalid song path");
+    if (!playlist_files_append(m3u_path, song_path)) return push_plugin_error(L, "could not update playlist");
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+/* plugin.playlist_remove(m3u_path, song_path) -> bool */
+static int l_plugin_playlist_remove(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
+    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "invalid song path");
+    if (!playlist_files_remove(m3u_path, song_path)) return push_plugin_error(L, "could not update playlist");
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+/* plugin.playlist_delete(m3u_path) -> bool */
+static int l_plugin_playlist_delete(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
+    bool ok = playlist_files_delete(m3u_path);
+    if (ok) metadata_db_playlist_delete_one(m3u_path);
+    lua_pushboolean(L, ok);
+    return 1;
+}
+
+/* ---- plugin.library_* -- paged, DB-backed library access (see gui.h's own
+ * gui_plugin_library_* comment for the design intent: bounded per call,
+ * never a whole-library dump). Every row pushes the same {id, path, title,
+ * artist, album, album_artist} shape for a song, or {name, count,
+ * first_song_id} for an artist/album group. ---- */
+
+static void push_song_row(lua_State * L, const song_row_t * row) {
+    /* Use display title fallback (file basename) for untagged tracks. */
+    char display_title[128];
+    metadata_db_song_display_title(row, display_title, sizeof(display_title));
+
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer) row->id); lua_setfield(L, -2, "id");
+    lua_pushstring(L, row->path); lua_setfield(L, -2, "path");
+    lua_pushstring(L, display_title); lua_setfield(L, -2, "title");
+    lua_pushstring(L, row->tags.artist); lua_setfield(L, -2, "artist");
+    lua_pushstring(L, row->tags.album); lua_setfield(L, -2, "album");
+    lua_pushstring(L, row->tags.album_artist); lua_setfield(L, -2, "album_artist");
+}
+
+static void push_group_row(lua_State * L, const group_row_t * row) {
+    lua_newtable(L);
+    lua_pushstring(L, row->name); lua_setfield(L, -2, "name");
+    lua_pushinteger(L, row->song_count); lua_setfield(L, -2, "count");
+    lua_pushinteger(L, (lua_Integer) row->first_song_id); lua_setfield(L, -2, "first_song_id");
+    /* Empty ("") for artists/album_artists -- only ever populated by
+     * metadata_db_get_albums_page_filtered() (see that function's own
+     * comment) -- disambiguates two different artists' same-titled albums,
+     * which now show as separate rows here instead of silently merging. */
+    lua_pushstring(L, row->album_artist); lua_setfield(L, -2, "album_artist");
+}
+
+static int push_song_rows_result(lua_State * L, const song_row_t * rows, int count) {
+    lua_newtable(L);
+    for (int i = 0; i < count; i++) {
+        push_song_row(L, &rows[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+/* plugin.library_song_count() -> integer */
+static int l_plugin_library_song_count(lua_State * L) {
+    lua_pushinteger(L, (lua_Integer) gui_plugin_library_song_count());
+    return 1;
+}
+
+/* plugin.library_get_songs(offset, limit, filters) -> { song, ... }, total
+ * -- offset/limit default to 0/GUI_PLUGIN_LIBRARY_MAX_PAGE; filters is an
+ * optional table with any of query/artist/album_artist/album (all optional
+ * substring-or-exact filters, see gui_plugin_library_get_songs()'s own
+ * comment). total is the match count across every page, for a plugin's own
+ * "page N of M" UI. */
+static int l_plugin_library_get_songs(lua_State * L) {
+    int offset = (int) luaL_optinteger(L, 1, 0);
+    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
+    const char * query = NULL, * artist = NULL, * album_artist = NULL, * album = NULL;
+    if (lua_istable(L, 3)) {
+        lua_getfield(L, 3, "query"); query = lua_tostring(L, -1);
+        lua_getfield(L, 3, "artist"); artist = lua_tostring(L, -1);
+        lua_getfield(L, 3, "album_artist"); album_artist = lua_tostring(L, -1);
+        lua_getfield(L, 3, "album"); album = lua_tostring(L, -1);
+        /* query/artist/album_artist/album above all point into the Lua
+         * stack slots pushed by lua_getfield() -- valid until something
+         * else touches the stack, which gui_plugin_library_get_songs()
+         * below doesn't do, so reading them after all four is safe. */
+    }
+
+    /* Heap-allocated, not a stack array -- song_row_t is ~1.25KB (a 600-
+     * byte path plus one cached_tags_t), and GUI_PLUGIN_LIBRARY_MAX_
+     * PAGE (200) of those is ~250KB. remote_control.c hit exactly this as a
+     * real on-device stack-overflow crash (see build_library_json()'s own
+     * comment) before it was fixed the same way; not worth trusting that
+     * this callback's own thread stack happens to be big enough just
+     * because it's the main thread rather than a bare pthread_create(). */
+    song_row_t * rows = malloc(sizeof(song_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE);
+    int64_t total = 0;
+    int n = rows ? gui_plugin_library_get_songs(query, artist, album_artist, album, offset, limit, rows, &total) : 0;
+    push_song_rows_result(L, rows, n);
+    free(rows);
+    lua_pushinteger(L, (lua_Integer) total);
+    return 2;
+}
+
+/* plugin.library_search(query, limit) -> { song, ... } */
+static int l_plugin_library_search(lua_State * L) {
+    const char * query = luaL_checkstring(L, 1);
+    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
+
+    song_row_t * rows = malloc(sizeof(song_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE); /* see get_songs()'s own comment */
+    int n = rows ? gui_plugin_library_search(query, limit, rows) : 0;
+    int result = push_song_rows_result(L, rows, n);
+    free(rows);
+    return result;
+}
+
+/* plugin.library_get_song(id) -> song | nil */
+static int l_plugin_library_get_song(lua_State * L) {
+    int64_t id = (int64_t) luaL_checkinteger(L, 1);
+    song_row_t row;
+    if (!gui_plugin_library_get_song(id, &row)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    push_song_row(L, &row);
+    return 1;
+}
+
+/* plugin.library_get_artists(offset, limit) -> { {name, count,
+ * first_song_id}, ... } */
+static int l_plugin_library_get_artists(lua_State * L) {
+    int offset = (int) luaL_optinteger(L, 1, 0);
+    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
+
+    group_row_t * rows = malloc(sizeof(group_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE); /* see get_songs()'s own comment */
+    int n = rows ? gui_plugin_library_get_artists(offset, limit, rows) : 0;
+    lua_newtable(L);
+    for (int i = 0; i < n; i++) {
+        push_group_row(L, &rows[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    free(rows);
+    return 1;
+}
+
+/* plugin.library_get_albums(offset, limit, artist) -> { {name, count,
+ * first_song_id}, ... } -- artist optional (nil/omitted means every album,
+ * unfiltered), matches either that name's artist or album_artist tag. */
+static int l_plugin_library_get_albums(lua_State * L) {
+    int offset = (int) luaL_optinteger(L, 1, 0);
+    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
+    const char * artist_filter = luaL_optstring(L, 3, NULL);
+
+    group_row_t * rows = malloc(sizeof(group_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE); /* see get_songs()'s own comment */
+    int n = rows ? gui_plugin_library_get_albums(offset, limit, artist_filter, rows) : 0;
+    lua_newtable(L);
+    for (int i = 0; i < n; i++) {
+        push_group_row(L, &rows[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    free(rows);
+    return 1;
+}
+
+/* plugin.refresh_library() -- triggers the same background rescan as
+ * Settings > Update Music Database, so a plugin that wrote new files under
+ * plugin.sd_root() can make them show up in library_*() without the user
+ * finding that menu item themselves. No-op if a rescan is already running. */
+static int l_plugin_refresh_library(lua_State * L) {
+    plugin_instance_t * inst = plugin_instance_for_state(L);
+    if (!inst || !inst->defined) return luaL_error(L, "plugin.refresh_library requires plugin.define first");
+    time_t now = time(NULL);
+    if (inst->last_library_refresh > 0 && now >= inst->last_library_refresh && now - inst->last_library_refresh < 60) {
+        lua_pushboolean(L, false); lua_pushliteral(L, "rate_limited"); return 2;
+    }
+    if (!gui_plugin_refresh_library()) {
+        lua_pushboolean(L, false); lua_pushliteral(L, "already_running"); return 2;
+    }
+    inst->last_library_refresh = now;
+    lua_pushboolean(L, true); lua_pushliteral(L, "started"); return 2;
+}
+
+/* ---- plugin.on(event, callback) -- see plugin_manager.h's own
+ * PLUGIN_MAX_EVENT_SUBSCRIBERS comment for the design rationale (multiple
+ * plugins can subscribe to the same event, unlike register_list_item()'s
+ * "each plugin's row coexists as its own entry" model). Each event has its
+ * own small subscriber array -- storage kept separate per event (not a
+ * generic dispatch table keyed by string) for the same reason
+ * l_plugin_register_list_item() gives each list_id its own array: this is a
+ * known, fixed set rather than genericity built ahead of needing it. ---- */
+
+typedef enum {
+    PLUGIN_EVENT_TRACK_STARTED = 0,
+    PLUGIN_EVENT_PAUSED,
+    PLUGIN_EVENT_RESUMED,
+    PLUGIN_EVENT_STOPPED,
+    PLUGIN_EVENT_SCREEN_WOKE,
+    PLUGIN_EVENT_QUEUE_EXHAUSTED,
+    PLUGIN_EVENT_VOLUME_CHANGED,
+    PLUGIN_EVENT_BATTERY_CHANGED,
+    PLUGIN_EVENT_SUSPENDING,
+    PLUGIN_EVENT_SYSTEM_RESUMED,
+    PLUGIN_EVENT_COUNT,
+} plugin_event_t;
+
+typedef struct {
+    lua_State * L;
+    int ref;
+} plugin_event_subscriber_t;
+
+static plugin_event_subscriber_t plugin_event_subscribers[PLUGIN_EVENT_COUNT][PLUGIN_MAX_EVENT_SUBSCRIBERS];
+static int plugin_event_subscriber_count[PLUGIN_EVENT_COUNT];
+static int plugin_last_volume_percent = -1;
+static bool plugin_battery_snapshot_valid = false;
+static plugin_battery_info_t plugin_last_battery_info;
+
+static int l_plugin_on(lua_State * L) {
+    const char * event = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    plugin_event_t idx;
+    if (strcmp(event, "track_started") == 0) idx = PLUGIN_EVENT_TRACK_STARTED;
+    else if (strcmp(event, "paused") == 0) idx = PLUGIN_EVENT_PAUSED;
+    else if (strcmp(event, "resumed") == 0) idx = PLUGIN_EVENT_RESUMED;
+    else if (strcmp(event, "stopped") == 0) idx = PLUGIN_EVENT_STOPPED;
+    else if (strcmp(event, "screen_woke") == 0) idx = PLUGIN_EVENT_SCREEN_WOKE;
+    else if (strcmp(event, "queue_exhausted") == 0) idx = PLUGIN_EVENT_QUEUE_EXHAUSTED;
+    else if (strcmp(event, "volume_changed") == 0) idx = PLUGIN_EVENT_VOLUME_CHANGED;
+    else if (strcmp(event, "battery_changed") == 0) idx = PLUGIN_EVENT_BATTERY_CHANGED;
+    else if (strcmp(event, "suspending") == 0) idx = PLUGIN_EVENT_SUSPENDING;
+    else if (strcmp(event, "system_resumed") == 0) idx = PLUGIN_EVENT_SYSTEM_RESUMED;
+    else return luaL_error(L, "plugin.on: unknown event '%s'", event);
+
+    /* A slot left empty by an aborted or failed plugin is reused first. */
+    int slot = -1;
+    for (int i = 0; i < plugin_event_subscriber_count[idx]; i++) {
+        if (!plugin_event_subscribers[idx][i].L) { slot = i; break; }
+    }
+    if (slot < 0 && plugin_event_subscriber_count[idx] >= PLUGIN_MAX_EVENT_SUBSCRIBERS) {
+        return luaL_error(L, "plugin.on: too many subscribers registered for \"%s\" (max %d)", event,
+                           PLUGIN_MAX_EVENT_SUBSCRIBERS);
+    }
+
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    if (slot < 0) slot = plugin_event_subscriber_count[idx]++;
+    plugin_event_subscriber_t * sub = &plugin_event_subscribers[idx][slot];
+    sub->L = plugin_main_state(L);
+    sub->ref = ref;
+    return 0;
+}
+
+/* ---- plugin.set_interval(seconds, callback) -> handle /
+ * plugin.clear_interval(handle) -- see plugin_manager.h's own
+ * PLUGIN_MAX_INTERVALS/PLUGIN_INTERVAL_MIN_MS comments. handle is the pool
+ * slot + 1 (0 reserved as "invalid"/never returned). ---- */
+
+typedef struct {
+    lua_State * L;
+    int ref;
+    bool active;
+} plugin_interval_t;
+
+static plugin_interval_t plugin_intervals[PLUGIN_MAX_INTERVALS];
+
+static int l_plugin_set_interval(lua_State * L) {
+    double seconds = luaL_checknumber(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    int slot = -1;
+    for (int i = 0; i < PLUGIN_MAX_INTERVALS; i++) {
+        if (!plugin_intervals[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        return luaL_error(L, "plugin.set_interval: too many active intervals (max %d)", PLUGIN_MAX_INTERVALS);
+    }
+
+    uint32_t period_ms = (uint32_t) (seconds * 1000.0);
+    if (period_ms < PLUGIN_INTERVAL_MIN_MS) period_ms = PLUGIN_INTERVAL_MIN_MS;
+
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    plugin_intervals[slot].L = plugin_main_state(L);
+    plugin_intervals[slot].ref = ref;
+    plugin_intervals[slot].active = true;
+
+    gui_plugin_set_interval(slot, period_ms);
+    lua_pushinteger(L, slot + 1);
+    return 1;
+}
+
+static int l_plugin_clear_interval(lua_State * L) {
+    lua_Integer handle = luaL_checkinteger(L, 1);
+    int slot = (int) handle - 1;
+    if (slot < 0 || slot >= PLUGIN_MAX_INTERVALS || !plugin_intervals[slot].active) return 0;
+
+    if (plugin_state_usable(plugin_intervals[slot].L))
+        luaL_unref(plugin_intervals[slot].L, LUA_REGISTRYINDEX, plugin_intervals[slot].ref);
+    plugin_intervals[slot].active = false;
+    plugin_intervals[slot].L = NULL;
+    gui_plugin_clear_interval(slot);
+    return 0;
+}
+
+static bool plugin_id_is_valid(const char * id) {
+    return plugin_id_charset_ok(id);
+}
+
+/* Checks whether a plugin ID collides with any already-loaded plugin
+ * instance. Ignoring case: plugin data lives on the card under the id
+ * (plugin_storage.c), and the card's file system ignores case. */
+static bool plugin_id_collides(const char * id, int exclude_slot) {
+    for (int i = 0; i < plugin_instance_count; i++) {
+        if (i != exclude_slot && plugin_instances[i].defined && strcasecmp(plugin_instances[i].id, id) == 0) return true;
+    }
+    return false;
+}
+
+/* plugin.define({ id=..., name=..., version=..., api_min=... }) establishes
+ * stable identity before future storage/permission APIs are added. It is
+ * deliberately legal only while this file is executing its top-level code:
+ * identity cannot change after callbacks and resources have been registered. */
+static int l_plugin_define(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (loading_plugin_slot < 0 || loading_plugin_slot >= PLUGIN_MAX_FILES ||
+        plugin_instances[loading_plugin_slot].L != L) {
+        return luaL_error(L, "plugin.define may only be called once during plugin loading");
+    }
+    plugin_instance_t * inst = &plugin_instances[loading_plugin_slot];
+    if (inst->defined) return luaL_error(L, "plugin.define may only be called once");
+
+    lua_getfield(L, 1, "id");
+    const char * id = luaL_checkstring(L, -1);
+    if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(inst->id)) {
+        return luaL_error(L, "plugin.define: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
+                          sizeof(inst->id) - 1);
+    }
+    if (plugin_id_collides(id, loading_plugin_slot)) {
+        return luaL_error(L, "plugin.define: duplicate plugin id '%s'", id);
+    }
+    snprintf(inst->id, sizeof(inst->id), "%s", id);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "name");
+    const char * name = luaL_optstring(L, -1, id);
+    snprintf(inst->name, sizeof(inst->name), "%s", name);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "version");
+    const char * version = luaL_optstring(L, -1, "0");
+    snprintf(inst->version, sizeof(inst->version), "%s", version);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "api_min");
+    lua_Integer api_min = luaL_optinteger(L, -1, 1);
+    lua_pop(L, 1);
+    if (api_min > PLUGIN_API_VERSION) {
+        return luaL_error(L, "plugin '%s' requires API %lld, player provides API %d", id,
+                          (long long) api_min, PLUGIN_API_VERSION);
+    }
+    inst->defined = true;
+    return 0;
+}
+
+static int l_plugin_api_version(lua_State * L) {
+    lua_pushinteger(L, PLUGIN_API_VERSION);
+    return 1;
+}
+
+static led_control_color_t check_led_color(lua_State * L, const char * api) {
+    const char * color = luaL_checkstring(L, 1);
+    if (strcmp(color, "red") == 0) return LED_CONTROL_RED;
+    if (strcmp(color, "blue") == 0) return LED_CONTROL_BLUE;
+    luaL_error(L, "%s: color must be 'red' or 'blue'", api);
+    return LED_CONTROL_RED; /* unreachable -- luaL_error() longjmps */
+}
+
+static int check_led_level(lua_State * L, int arg, int default_level, const char * api) {
+    (void) api;
+    if (lua_gettop(L) < arg || lua_isnil(L, arg)) return default_level;
+    lua_Integer level = luaL_checkinteger(L, arg);
+    if (level < 0) return 0;
+    if (level > 100) return 100;
+    return (int) level;
+}
+
+static int check_led_interval(lua_State * L, int arg, const char * api) {
+    lua_Integer value = luaL_checkinteger(L, arg);
+    if (value < 50) return 50;
+    if (value > 60000) return 60000;
+    (void) api;
+    return (int) value;
+}
+
+static int l_plugin_led_available(lua_State * L) {
+    lua_pushboolean(L, led_control_available());
+    return 1;
+}
+
+static int l_plugin_led_set(lua_State * L) {
+    led_control_color_t color = check_led_color(L, "plugin.led_set");
+    int level;
+    if (lua_type(L, 2) == LUA_TBOOLEAN) {
+        level = lua_toboolean(L, 2) ? 100 : 0;
+    } else if (lua_type(L, 2) == LUA_TNUMBER) {
+        level = check_led_level(L, 2, 0, "plugin.led_set");
+    } else {
+        return luaL_error(L, "plugin.led_set: second argument must be a boolean or integer brightness 0..100");
+    }
+    if (!led_control_available())
+        return luaL_error(L, "plugin.led_set: charge-status LEDs are not available on this board");
+
+    plugin_led_override_owner = plugin_main_state(L);
+    led_control_set_override(color, level);
+    return 0;
+}
+
+static int l_plugin_led_blink(lua_State * L) {
+    led_control_color_t color = check_led_color(L, "plugin.led_blink");
+    int on_ms = check_led_interval(L, 2, "plugin.led_blink");
+    int off_ms = check_led_interval(L, 3, "plugin.led_blink");
+    int level = check_led_level(L, 4, 100, "plugin.led_blink");
+    if (!led_control_available())
+        return luaL_error(L, "plugin.led_blink: charge-status LEDs are not available on this board");
+
+    plugin_led_override_owner = plugin_main_state(L);
+    if (!led_control_blink(color, on_ms, off_ms, level))
+        return luaL_error(L, "plugin.led_blink: could not create an LVGL effect timer");
+    return 0;
+}
+
+static int l_plugin_led_breathe(lua_State * L) {
+    led_control_color_t color = check_led_color(L, "plugin.led_breathe");
+    lua_Integer input = luaL_checkinteger(L, 2);
+    if (input < 1)
+        return luaL_error(L, "plugin.led_breathe: period or breaths per minute must be positive");
+    int period_ms;
+    if (input <= 600) {
+        int bpm = (int) input;
+        period_ms = (60000 + bpm / 2) / bpm;
+    } else {
+        period_ms = input > 120000 ? 120000 : (int) input;
+    }
+    int level = check_led_level(L, 3, 100, "plugin.led_breathe");
+    if (!led_control_available())
+        return luaL_error(L, "plugin.led_breathe: charge-status LEDs are not available on this board");
+
+    plugin_led_override_owner = plugin_main_state(L);
+    if (!led_control_breathe(color, period_ms, level))
+        return luaL_error(L, "plugin.led_breathe: could not create an LVGL effect timer");
+    return 0;
+}
+
+static int l_plugin_led_get(lua_State * L) {
+    led_control_color_t color = check_led_color(L, "plugin.led_get");
+    static const char * const modes[] = { "off", "on", "blink", "breathe", "status" };
+    led_control_mode_t mode = led_control_get_mode(color);
+    int level = led_control_get_level(color);
+    if (mode < LED_CONTROL_MODE_OFF || mode > LED_CONTROL_MODE_STATUS) mode = LED_CONTROL_MODE_OFF;
+    lua_newtable(L);
+    lua_pushstring(L, modes[mode]); lua_setfield(L, -2, "mode");
+    lua_pushinteger(L, level); lua_setfield(L, -2, "level");
+    return 1;
+}
+
+static int l_plugin_led_status(lua_State * L) {
+    bool both = lua_gettop(L) == 0 || lua_isnil(L, 1);
+    led_control_color_t color = LED_CONTROL_RED;
+    if (!both) color = check_led_color(L, "plugin.led_status");
+    if (!led_control_available())
+        return luaL_error(L, "plugin.led_status: charge-status LEDs are not available on this board");
+
+    plugin_led_override_owner = plugin_main_state(L);
+    if (both) led_control_set_all_status();
+    else led_control_set_status(color);
+    return 0;
+}
+
+static int l_plugin_led_release(lua_State * L) {
+    release_plugin_led_override(plugin_main_state(L));
+    return 0;
+}
+
+static const char * const plugin_capabilities[] = {
+    "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.theme",
+    "filesystem.sd", "playback.control", "playback.state", "playback.events",
+    "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
+    "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
+    "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
+    "ui.theme_refresh", "ui.reload", "ui.launcher_layout", "audio.hw_volume_curve", "ui.quick_toggle",
+    "ui.text_view", "data.image_thumbnail", "ui.list_grid", "ui.list_showing",
+    "ui.text_view_images", "ui.list_wrap", "ui.settings_list_wrap", "playback.transport_skip",
+    "storage.secrets_get", "filesystem.usage", "network.wifi_ssid", "ui.details", "radio.list",
+    "filesystem.paths"
+};
+
+/* Software tokens above say which API exists; "hw.*" tokens (board.h's
+ * capability catalogue, e.g. "hw.bt_audio_out") say whether this board's
+ * hardware has the function. */
+static int l_plugin_has_capability(lua_State * L) {
+    const char * requested = luaL_checkstring(L, 1);
+    bool found = false;
+    for (size_t i = 0; i < sizeof(plugin_capabilities) / sizeof(plugin_capabilities[0]); i++) {
+        if (strcmp(requested, plugin_capabilities[i]) == 0) { found = true; break; }
+    }
+    board_cap_t cap;
+    if (!found && board_cap_from_name(requested, &cap)) found = board_has(cap);
+    lua_pushboolean(L, found);
+    return 1;
+}
+
+/* plugin.has_feature("feature.airplay") -> bool: an optional software
+ * feature built into this player (mt_features.h). */
+static int l_plugin_has_feature(lua_State * L) {
+    lua_pushboolean(L, mt_feature_enabled(luaL_checkstring(L, 1)));
+    return 1;
+}
+
+/* plugin.board() -> { name, model, screen = { w, h }, caps = { "hw.…", ... } }:
+ * the hardware only (features: plugin.has_feature()). */
+static int l_plugin_board(lua_State * L) {
+    lua_newtable(L);
+    lua_pushstring(L, BOARD.name); lua_setfield(L, -2, "name");
+    lua_pushstring(L, BOARD.model); lua_setfield(L, -2, "model");
+    lua_newtable(L);
+    lua_pushinteger(L, BOARD.screen.w); lua_setfield(L, -2, "w");
+    lua_pushinteger(L, BOARD.screen.h); lua_setfield(L, -2, "h");
+    lua_setfield(L, -2, "screen");
+    lua_newtable(L);
+    lua_Integer n = 0;
+    for (size_t i = 0; i < BOARD_CAP_COUNT; i++) {
+        board_cap_t cap = board_cap_at(i);
+        if (!board_has(cap)) continue;
+        lua_pushstring(L, board_cap_name(cap));
+        lua_rawseti(L, -2, ++n);
+    }
+    lua_setfield(L, -2, "caps");
+    return 1;
+}
+
+/* plugin.media_capabilities(), for remote-provider plugins. Every field here is a verified fact about this exact
+ * pipeline (audio.c's decoder_open()/audio_output.c), not an aspirational
+ * one:
+ * - mp3/aac/flac are all three already confirmed working for a direct
+ *   http(s):// stream today (decoder_open()'s is_stream_url() branch --
+ *   MP3 default, FLAC via the "#.flac" hint, AAC via "#.aac"/"#.aacp" or
+ *   an "audio/aac" Content-Type, ADTS framing via aac_open_stream()).
+ * - max_bit_depth is 16 for what this function actually describes: a
+ *   plugin-provided REMOTE stream (see decoder_open()'s is_stream_url()
+ *   branch this whole comment block is about). audio.c's can_use_wide_path()
+ *   explicitly excludes any decoder with a net_stream set, so a plugin's
+ *   direct http(s):// stream stays on the s16 decode/output path regardless
+ *   of what the source claims -- this is still an accurate, verified fact,
+ *   not a stale one. It is NOT true of local file playback any more: local
+ *   FLAC/WAV/ALAC/APE/AIFF sources above 16-bit now reach the DAC at
+ *   PCM_FORMAT_S24_LE (audio_output.c's open_device()) when hw_params
+ *   negotiation for it succeeds. The USB-DAC and Bluetooth aplay spawns are
+ *   still unconditionally "-f S16_LE" with no exception, same as before.
+ * - max_channels is 2: nothing in this pipeline remaps or mixes channel
+ *   counts; every path above passes `channels` straight through with no
+ *   multichannel-aware code found anywhere in the codebase.
+ * - max_sample_rate is deliberately left 0 (unspecified) rather than a
+ *   guessed number: config.rate is passed straight through to pcm_open()
+ *   with no software-side cap anywhere in this pipeline, so the real
+ *   ceiling is whatever this device's DAC/kernel driver negotiates --
+ *   that's a hardware fact this codebase doesn't state anywhere and this
+ *   function should not invent one. Fill this in once a real number is
+ *   confirmed against the actual hardware, rather than guessing here. */
+static int l_plugin_media_capabilities(lua_State * L) {
+    lua_newtable(L);
+
+    lua_newtable(L);
+    lua_pushstring(L, "mp3");  lua_rawseti(L, -2, 1);
+    lua_pushstring(L, "aac");  lua_rawseti(L, -2, 2);
+    lua_pushstring(L, "flac"); lua_rawseti(L, -2, 3);
+    lua_setfield(L, -2, "codecs");
+
+    lua_newtable(L);
+    lua_pushstring(L, "mp3");  lua_rawseti(L, -2, 1);
+    lua_pushstring(L, "adts"); lua_rawseti(L, -2, 2);
+    lua_pushstring(L, "flac"); lua_rawseti(L, -2, 3);
+    lua_setfield(L, -2, "containers");
+
+    lua_pushinteger(L, 0);  lua_setfield(L, -2, "max_sample_rate"); /* see comment above -- unverified, do not treat as 0 Hz */
+    lua_pushinteger(L, 16); lua_setfield(L, -2, "max_bit_depth");
+    lua_pushinteger(L, 2);  lua_setfield(L, -2, "max_channels");
+
+    lua_pushboolean(L, true);  lua_setfield(L, -2, "direct_http_streaming");
+    lua_pushboolean(L, false); lua_setfield(L, -2, "range_seeking"); /* not built yet */
+    lua_pushboolean(L, false); lua_setfield(L, -2, "hls");
+    lua_pushboolean(L, false); lua_setfield(L, -2, "dash");
+
+    lua_newtable(L); lua_setfield(L, -2, "encryption_modes"); /* empty: none supported */
+    lua_newtable(L); lua_setfield(L, -2, "drm_systems");      /* empty: none supported */
+
+    return 1;
+}
+
+/* plugin.storage.get(key [, default]) / .set(key, value) / .delete(key) /
+ * .list(prefix) -- see plugin_storage.h's own threat-model comment.
+ * Values round-trip arbitrary bytes (luaL_checklstring/lua_pushlstring),
+ * not just NUL-terminated text. */
+static int l_plugin_storage_get(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    char * value = NULL;
+    size_t value_len = 0;
+    if (plugin_storage_get(id, key, &value, &value_len)) {
+        lua_pushlstring(L, value, value_len);
+        free(value);
+        return 1;
+    }
+    if (lua_gettop(L) >= 2) {
+        lua_pushvalue(L, 2);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+static int l_plugin_storage_set(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    size_t value_len = 0;
+    const char * value = luaL_checklstring(L, 2, &value_len);
+    if (!plugin_storage_set(id, key, value, value_len)) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "plugin.storage.set failed");
+        return 2;
+    }
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int l_plugin_storage_delete(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    lua_pushboolean(L, plugin_storage_delete(id, key));
+    return 1;
+}
+
+static int l_plugin_storage_list(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * prefix = luaL_optstring(L, 1, "");
+    char ** keys = NULL;
+    int count = plugin_storage_list(id, prefix, &keys);
+    if (count < 0) {
+        return push_plugin_error(L, "plugin.storage.list failed");
+    }
+    lua_newtable(L);
+    for (int i = 0; i < count; i++) {
+        lua_pushstring(L, keys[i]);
+        lua_rawseti(L, -2, i + 1);
+        free(keys[i]);
+    }
+    free(keys);
+    return 1;
+}
+
+/* plugin.secrets.get/set/exists/delete -- deliberately no .list(), so a
+ * plugin (or anything reading its own diagnostics) can't enumerate secret
+ * key names; see plugin_storage.h's threat-model comment. get() reads only
+ * the calling plugin's own namespace, same as plugin.storage.get(). */
+static int l_plugin_secrets_get(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    char * value = NULL;
+    size_t value_len = 0;
+    if (plugin_secrets_get(id, key, &value, &value_len)) {
+        lua_pushlstring(L, value, value_len);
+        free(value);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+static int l_plugin_secrets_set(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    size_t value_len = 0;
+    const char * value = luaL_checklstring(L, 2, &value_len);
+    lua_pushboolean(L, plugin_secrets_set(id, key, value, value_len));
+    return 1;
+}
+
+static int l_plugin_secrets_exists(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    lua_pushboolean(L, plugin_secrets_exists(id, key));
+    return 1;
+}
+
+static int l_plugin_secrets_delete(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    lua_pushboolean(L, plugin_secrets_delete(id, key));
+    return 1;
+}
+
+static int l_plugin_get_app_info(lua_State * L) {
+    lua_newtable(L);
+    lua_pushstring(L, app_version_label()); lua_setfield(L, -2, "version");
+    lua_pushstring(L, app_build_identifier()); lua_setfield(L, -2, "build");
+#ifdef HOST_BUILD
+    lua_pushstring(L, "host");
+#else
+    /* "hiby-<board>": "hiby-r1" as before on the R1, the real board elsewhere. */
+    lua_pushfstring(L, "hiby-%s", BOARD.name);
+#endif
+    lua_setfield(L, -2, "platform");
+    lua_pushinteger(L, PLUGIN_API_VERSION); lua_setfield(L, -2, "plugin_api");
+    return 1;
+}
+
+static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc);
+
+/* plugin.image_thumbnail_async(source_path, dest_path, max_w, max_h, callback):
+ * reads an image file, scales it to fit max_w x max_h and writes an LVGL .bin
+ * image lv_image can draw from the file with no decode. The read and decode
+ * run on a worker; the callback gets (dest_path) or (nil, reason) from
+ * plugin_manager_poll(). One job at a time across all plugins: decoding can
+ * take a few MB. */
+#define PLUGIN_IMAGE_THUMB_MAX_BYTES (3u * 1024u * 1024u)
+#define PLUGIN_IMAGE_THUMB_MAX_SIDE 800
+#define PLUGIN_IMAGE_THUMB_STACK_SIZE (4 * 1024 * 1024) /* same as the album cover decode worker */
+
+typedef struct {
+    bool active;
+    atomic_bool done;
+    atomic_bool cancel;
+    pthread_t thread;
+    lua_State * L;  /* plugin main state: a coroutine that started the job may be collected */
+    int callback_ref;
+    char source_path[PATH_MAX];
+    char dest_path[PATH_MAX];
+    int max_w;
+    int max_h;
+    bool ok;
+    const char * error; /* static string */
+} plugin_image_thumb_t;
+
+static plugin_image_thumb_t plugin_image_thumb;
+
+static bool plugin_image_thumb_cancelled(void * user) {
+    return atomic_load(&((plugin_image_thumb_t *) user)->cancel);
+}
+
+static void * plugin_image_thumb_thread(void * arg) {
+    plugin_image_thumb_t * job = arg;
+    unsigned char * data = NULL;
+    size_t len = 0;
+    int fd = open(job->source_path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    struct stat st;
+    if (fd < 0) {
+        job->error = "could not open image";
+    } else if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        job->error = "not a regular file";
+    } else if (st.st_size < 0 || (uint64_t) st.st_size > PLUGIN_IMAGE_THUMB_MAX_BYTES) {
+        job->error = "image too large";
+    } else {
+        len = (size_t) st.st_size;
+        data = malloc(len ? len : 1);
+        if (!data) {
+            job->error = "nomem";
+        } else {
+            size_t off = 0;
+            while (off < len && !plugin_image_thumb_cancelled(job)) {
+                ssize_t n = read(fd, data + off, len - off);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                off += (size_t) n;
+            }
+            if (plugin_image_thumb_cancelled(job)) job->error = "cancelled";
+            else if (off != len) job->error = "could not read image";
+        }
+    }
+    if (fd >= 0) close(fd);
+    if (!job->error && plugin_image_thumb_cancelled(job)) {
+        job->error = "cancelled";
+    } else if (!job->error) {
+        job->ok = image_thumb_write_bin(data, len, job->max_w, job->max_h, job->dest_path, ARTWORK_PRIO_THUMBNAIL,
+                                        plugin_image_thumb_cancelled, job, &job->error);
+    }
+    free(data);
+    atomic_store(&job->done, true);
+    return NULL;
+}
+
+static bool path_has_bin_extension(const char * path) {
+    size_t n = strlen(path);
+    return n > 4 && strcmp(path + n - 4, ".bin") == 0;
+}
+
+/* Starts the thumbnail job once the Lua API has validated its own
+ * argument layout and emitted any API-specific argument errors. */
+static int plugin_image_thumbnail_start(lua_State * L, const char * source_path,
+                                       const char * dest_path, int max_w, int max_h,
+                                       int callback_index) {
+    if (plugin_image_thumb.active) return push_plugin_error(L, "busy");
+
+    plugin_image_thumb_t * job = &plugin_image_thumb;
+    memset(job, 0, sizeof(*job));
+    atomic_init(&job->done, false);
+    atomic_init(&job->cancel, false);
+    snprintf(job->source_path, sizeof(job->source_path), "%s", source_path);
+    snprintf(job->dest_path, sizeof(job->dest_path), "%s", dest_path);
+    job->max_w = max_w;
+    job->max_h = max_h;
+    lua_pushvalue(L, callback_index);
+    job->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    job->L = plugin_main_state(L);
+
+    pthread_attr_t attr;
+    bool attr_ok = pthread_attr_init(&attr) == 0;
+    if (attr_ok) pthread_attr_setstacksize(&attr, PLUGIN_IMAGE_THUMB_STACK_SIZE);
+    int rc = pthread_create(&job->thread, attr_ok ? &attr : NULL, plugin_image_thumb_thread, job);
+    if (attr_ok) pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        luaL_unref(L, LUA_REGISTRYINDEX, job->callback_ref);
+        job->callback_ref = LUA_NOREF;
+        job->L = NULL;
+        return push_plugin_error(L, "could not start image worker");
+    }
+    job->active = true;
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int l_plugin_image_thumbnail_async(lua_State * L) {
+    const char * source_path = check_plugin_external_path(L, 1, "plugin.image_thumbnail_async");
+    const char * dest_path = check_plugin_writable_path(L, 2, "plugin.image_thumbnail_async");
+    lua_Integer max_w = luaL_checkinteger(L, 3);
+    lua_Integer max_h = luaL_checkinteger(L, 4);
+    luaL_checktype(L, 5, LUA_TFUNCTION);
+    if (max_w < 16 || max_w > PLUGIN_IMAGE_THUMB_MAX_SIDE || max_h < 16 || max_h > PLUGIN_IMAGE_THUMB_MAX_SIDE)
+        return luaL_error(L, "plugin.image_thumbnail_async: max_w/max_h must be 16..%d", PLUGIN_IMAGE_THUMB_MAX_SIDE);
+    if (strlen(source_path) >= sizeof(plugin_image_thumb.source_path) || strlen(dest_path) >= sizeof(plugin_image_thumb.dest_path) - 8)
+        return luaL_error(L, "plugin.image_thumbnail_async: path too long");
+    if (!path_has_bin_extension(dest_path)) return luaL_error(L, "plugin.image_thumbnail_async: dest_path must end in .bin");
+    return plugin_image_thumbnail_start(L, source_path, dest_path, (int) max_w, (int) max_h, 5);
+}
+
+/* Delivers a finished job's callback (skipped when cancelled or the plugin
+ * was aborted) and frees the slot. */
+static void plugin_image_thumb_poll(void) {
+    plugin_image_thumb_t * job = &plugin_image_thumb;
+    if (!job->active || !atomic_load(&job->done)) return;
+    pthread_join(job->thread, NULL);
+    job->active = false;
+    lua_State * L = job->L;
+    int ref = job->callback_ref;
+    job->L = NULL;
+    job->callback_ref = LUA_NOREF;
+    if (!plugin_state_usable(L)) return; /* frozen or closed state: never touched again */
+    if (!atomic_load(&job->cancel)) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        if (job->ok) {
+            lua_pushstring(L, job->dest_path);
+            lua_pushnil(L);
+        } else {
+            lua_pushnil(L);
+            lua_pushstring(L, job->error ? job->error : "could not read image");
+        }
+        if (plugin_call(L, 2, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(L, -1);
+            fprintf(stderr, "[plugins] image_thumbnail_async callback error: %s\n", err ? err : "unknown error");
+            lua_pop(L, 1);
+        }
+    }
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+}
+
+/* For deinit: stops the worker at its next cancellation point and waits,
+ * without calling Lua. */
+static void plugin_image_thumb_cancel(void) {
+    plugin_image_thumb_t * job = &plugin_image_thumb;
+    if (!job->active) return;
+    atomic_store(&job->cancel, true);
+    pthread_join(job->thread, NULL);
+    job->active = false;
+    if (plugin_state_usable(job->L)) luaL_unref(job->L, LUA_REGISTRYINDEX, job->callback_ref);
+    job->L = NULL;
+    job->callback_ref = LUA_NOREF;
+}
+
+/* One context per shown view. The view's on_close is delivered later (after
+ * the back transition), so a closing view and a new one can briefly coexist.
+ * L is the plugin's main state: a coroutine that opened the view may be
+ * collected before the callbacks run. */
+#define TEXT_VIEW_CTX_MAX 4
+typedef struct {
+    bool live;
+    lua_State * L;
+    int turn_ref;
+    int close_ref;
+} text_view_ctx_t;
+
+static text_view_ctx_t text_view_ctxs[TEXT_VIEW_CTX_MAX];
+
+/* A hard-aborted state is frozen: its registry is never touched again. */
+static void text_view_ctx_release(text_view_ctx_t * ctx) {
+    if (plugin_state_usable(ctx->L)) {
+        if (ctx->turn_ref != LUA_NOREF) luaL_unref(ctx->L, LUA_REGISTRYINDEX, ctx->turn_ref);
+        if (ctx->close_ref != LUA_NOREF) luaL_unref(ctx->L, LUA_REGISTRYINDEX, ctx->close_ref);
+    }
+    ctx->live = false;
+    ctx->L = NULL;
+    ctx->turn_ref = LUA_NOREF;
+    ctx->close_ref = LUA_NOREF;
+}
+
+/* Lua pushes do not grow a frozen stack: check before any Lua API access.
+ * The slot stays live: the view and its queued close still hold this
+ * pointer, and releasing it would let a new reader reuse the slot before
+ * that close runs. */
+static bool text_view_ctx_prepare(text_view_ctx_t * ctx) {
+    if (!ctx || !ctx->live) return false;
+    return plugin_state_usable(ctx->L);
+}
+
+static void text_view_turn_trampoline(int page, int pages, size_t byte_offset, void * user) {
+    text_view_ctx_t * ctx = user;
+    if (!text_view_ctx_prepare(ctx) || ctx->turn_ref == LUA_NOREF) return;
+
+    lua_State * L = ctx->L;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->turn_ref);
+    lua_pushinteger(L, page);
+    lua_pushinteger(L, pages);
+    lua_pushinteger(L, (lua_Integer) byte_offset);
+    if (plugin_call(L, 3, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] show_text_view on_turn error: %s\n", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+/* Always installed for a view with a context, so the context is released
+ * even when the plugin passed no on_close. */
+static void text_view_close_trampoline(int page, size_t byte_offset, void * user) {
+    text_view_ctx_t * ctx = user;
+    if (!ctx || !ctx->live) return;
+
+    /* Retire the slot after this delivery even when the plugin was aborted.
+     * The callback is skipped; the slot is not reusable until then. */
+    if (text_view_ctx_prepare(ctx) && ctx->close_ref != LUA_NOREF) {
+        lua_State * L = ctx->L;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->close_ref);
+        lua_pushinteger(L, page);
+        lua_pushinteger(L, (lua_Integer) byte_offset);
+        if (plugin_call(L, 2, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(L, -1);
+            fprintf(stderr, "[plugins] show_text_view on_close error: %s\n", err ? err : "unknown error");
+            lua_pop(L, 1);
+        }
+    }
+    text_view_ctx_release(ctx);
+}
+
+typedef struct {
+    bool has_turn;
+    bool has_close;
+    int turn_ref;
+    int close_ref;
+} text_view_refs_t;
+
+/* Stack: lightuserdata, on_turn or nil, on_close or nil. Refs the functions
+ * already validated above; a later __index on the options table is not read. */
+static int text_view_store_refs(lua_State * L) {
+    text_view_refs_t * refs = lua_touserdata(L, 1);
+    if (refs->has_turn) {
+        lua_pushvalue(L, 2);
+        refs->turn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    if (refs->has_close) {
+        lua_pushvalue(L, 3);
+        refs->close_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    return 0;
+}
+
+/* plugin.show_details(title, sections): sections = { { title = "...",
+ * rows = { { "Key", "Value" }, ... } }, ... }. A read-only page of grouped
+ * key/value cards in the settings style. Up to 64 sections, 256 rows. */
+#define PLUGIN_DETAILS_MAX 320
+static int l_plugin_show_details(lua_State * L) {
+    const char * title = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    const char ** keys = calloc(PLUGIN_DETAILS_MAX, sizeof(char *));
+    const char ** values = calloc(PLUGIN_DETAILS_MAX, sizeof(char *));
+    char ** owned = calloc(PLUGIN_DETAILS_MAX * 2, sizeof(char *));
+    int n = 0, owned_n = 0;
+    if (!keys || !values || !owned) {
+        free(keys); free(values); free(owned);
+        return luaL_error(L, "plugin.show_details: out of memory");
+    }
+    lua_Unsigned sections = lua_rawlen(L, 2);
+    for (lua_Unsigned s = 1; s <= sections && s <= 64 && n < PLUGIN_DETAILS_MAX; s++) {
+        lua_rawgeti(L, 2, (lua_Integer) s);
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "title");
+            if (lua_isstring(L, -1) && n < PLUGIN_DETAILS_MAX) {
+                owned[owned_n] = strdup(lua_tostring(L, -1));
+                keys[n] = owned[owned_n++];
+                values[n++] = NULL;
+            }
+            lua_pop(L, 1);
+            lua_getfield(L, -1, "rows");
+            if (lua_istable(L, -1)) {
+                lua_Unsigned rows = lua_rawlen(L, -1);
+                for (lua_Unsigned r = 1; r <= rows && n < PLUGIN_DETAILS_MAX; r++) {
+                    lua_rawgeti(L, -1, (lua_Integer) r);
+                    if (lua_istable(L, -1)) {
+                        lua_rawgeti(L, -1, 1);
+                        lua_rawgeti(L, -2, 2);
+                        owned[owned_n] = strdup(luaL_tolstring(L, -2, NULL));
+                        keys[n] = owned[owned_n++];
+                        lua_pop(L, 1);
+                        if (lua_isnil(L, -1)) {
+                            owned[owned_n] = strdup("-");
+                        } else {
+                            owned[owned_n] = strdup(luaL_tolstring(L, -1, NULL));
+                            lua_pop(L, 1);
+                        }
+                        values[n++] = owned[owned_n++];
+                        lua_pop(L, 2);
+                    }
+                    lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+    gui_plugin_show_details(title, keys, values, n);
+    for (int i = 0; i < owned_n; i++) free(owned[i]);
+    free(owned); free(keys); free(values);
+    return 0;
+}
+
+static int l_plugin_show_text_view(lua_State * L) {
+    const char * title = luaL_checkstring(L, 1);
+    size_t text_len = 0;
+    const char * text = luaL_checklstring(L, 2, &text_len);
+
+    gui_text_view_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    const char * image_paths[GUI_TEXT_VIEW_MAX_IMAGES];
+
+    bool has_turn = false;
+    bool has_close = false;
+    int turn_abs = 0;
+    int close_abs = 0;
+
+    if (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) {
+        if (!lua_istable(L, 3)) {
+            return luaL_error(L, "plugin.show_text_view: options must be a table");
+        }
+
+        lua_getfield(L, 3, "page");
+        if (!lua_isnil(L, -1)) {
+            if (lua_isnumber(L, -1)) {
+                opts.has_page = true;
+                opts.page = (int) lua_tointeger(L, -1);
+            }
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 3, "offset");
+        if (!lua_isnil(L, -1)) {
+            if (lua_isnumber(L, -1)) {
+                opts.has_offset = true;
+                lua_Integer off = lua_tointeger(L, -1);
+                opts.offset = (off < 0) ? 0 : (size_t) off;
+            }
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 3, "font_px");
+        lua_pop(L, 1);
+
+        /* options.images: picture files for "<ESC>n<ESC>" markers (see
+         * gui_text_view.h). The table stays on the stack until the view has
+         * copied the paths, keeping these strings alive. */
+        lua_getfield(L, 3, "images");
+        if (!lua_isnil(L, -1)) {
+            if (!lua_istable(L, -1)) return luaL_error(L, "plugin.show_text_view: images must be a list of paths");
+            lua_Integer count = luaL_len(L, -1);
+            if (count < 0 || count > GUI_TEXT_VIEW_MAX_IMAGES)
+                return luaL_error(L, "plugin.show_text_view: at most %d images", GUI_TEXT_VIEW_MAX_IMAGES);
+            for (lua_Integer i = 1; i <= count; i++) {
+                lua_rawgeti(L, -1, i);
+                size_t len = 0;
+                const char * path = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &len) : NULL;
+                if (!path || len == 0 || len >= 512 || strlen(path) != len)
+                    return luaL_error(L, "plugin.show_text_view: images[%d] must be a path", (int) i);
+                image_paths[i - 1] = path;
+                lua_pop(L, 1);
+            }
+            opts.images = image_paths;
+            opts.image_count = (int) count;
+        } else {
+            lua_pop(L, 1);
+        }
+
+        lua_getfield(L, 3, "on_turn");
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isfunction(L, -1)) {
+                return luaL_error(L, "plugin.show_text_view: on_turn must be a function");
+            }
+            has_turn = true;
+            turn_abs = lua_gettop(L);
+        } else {
+            lua_pop(L, 1);
+        }
+
+        lua_getfield(L, 3, "on_close");
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isfunction(L, -1)) {
+                return luaL_error(L, "plugin.show_text_view: on_close must be a function");
+            }
+            has_close = true;
+            close_abs = lua_gettop(L);
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+
+    if (gui_text_view_is_open()) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "busy");
+        return 2;
+    }
+
+    text_view_ctx_t * ctx = NULL;
+    if (has_turn || has_close) {
+        for (int i = 0; i < TEXT_VIEW_CTX_MAX; i++) {
+            if (!text_view_ctxs[i].live) {
+                ctx = &text_view_ctxs[i];
+                break;
+            }
+        }
+        if (!ctx) {
+            lua_pushboolean(L, false);
+            lua_pushstring(L, "busy");
+            return 2;
+        }
+
+        /* Slot stays free until both refs exist. A Lua error while storing
+         * them must not consume a context. */
+        if (!lua_checkstack(L, 4)) return luaL_error(L, "stack overflow");
+        lua_State * main_L = plugin_main_state(L);
+        text_view_refs_t refs = { has_turn, has_close, LUA_NOREF, LUA_NOREF };
+        lua_pushcfunction(L, text_view_store_refs);
+        lua_pushlightuserdata(L, &refs);
+        if (has_turn) lua_pushvalue(L, turn_abs);
+        else lua_pushnil(L);
+        if (has_close) lua_pushvalue(L, close_abs);
+        else lua_pushnil(L);
+        if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+            if (refs.turn_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, refs.turn_ref);
+            if (refs.close_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, refs.close_ref);
+            return lua_error(L);
+        }
+        ctx->L = main_L;
+        ctx->turn_ref = refs.turn_ref;
+        ctx->close_ref = refs.close_ref;
+        ctx->live = true;
+    }
+
+    bool ok = gui_text_view_show(title, text, text_len, &opts,
+                                 (ctx && has_turn) ? text_view_turn_trampoline : NULL,
+                                 ctx ? text_view_close_trampoline : NULL, ctx);
+    if (!ok) {
+        if (ctx) text_view_ctx_release(ctx);
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "unavailable");
+        return 2;
+    }
+
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static const luaL_Reg plugin_funcs[] = {
+    { "define",                    l_plugin_define },
+    { "api_version",               l_plugin_api_version },
+    { "has_capability",            l_plugin_has_capability },
+    { "has_feature",               l_plugin_has_feature },
+    { "board",                     l_plugin_board },
+    { "get_app_info",              l_plugin_get_app_info },
+    { "led_available",             l_plugin_led_available },
+    { "led_set",                   l_plugin_led_set },
+    { "led_blink",                 l_plugin_led_blink },
+    { "led_breathe",               l_plugin_led_breathe },
+    { "led_get",                   l_plugin_led_get },
+    { "led_status",                l_plugin_led_status },
+    { "led_release",               l_plugin_led_release },
+    { "register_list_item",        l_plugin_register_list_item },
+    { "register_stream_media_tile", l_plugin_register_stream_media_tile },
+    { "register_quick_toggle",     l_plugin_register_quick_toggle },
+    { "set_quick_toggle",          l_plugin_set_quick_toggle },
+    { "show_list",                 l_plugin_show_list },
+    { "is_list_showing",           l_plugin_is_list_showing },
+    { "show_settings_list",        l_plugin_show_settings_list },
+    { "list_dir",                  l_plugin_list_dir },
+    { "sd_root",                   l_plugin_sd_root },
+    { "playlist_list",             l_plugin_playlist_list },
+    { "playlist_read",             l_plugin_playlist_read },
+    { "playlist_create",           l_plugin_playlist_create },
+    { "playlist_add",              l_plugin_playlist_add },
+    { "playlist_remove",           l_plugin_playlist_remove },
+    { "playlist_delete",           l_plugin_playlist_delete },
+    { "mkdir",                     l_plugin_mkdir },
+    { "fs_usage",                  l_plugin_fs_usage },
+    { "wifi_ssid",                 l_plugin_wifi_ssid },
+    { "paths",                     l_plugin_paths },
+    { "radio_list",                l_plugin_radio_list },
+    { "radio_add",                 l_plugin_radio_add },
+    { "radio_remove",              l_plugin_radio_remove },
+    { "play_file",                 l_plugin_play_file },
+    { "play_list",                 l_plugin_play_list },
+    { "play_remote",               l_plugin_play_remote },
+    { "queue_remote_list",         l_plugin_queue_remote_list },
+    { "show_toast",                l_plugin_show_toast },
+    { "set_icon",                  l_plugin_set_icon },
+    { "set_background_color",      l_plugin_set_background_color },
+    { "set_text_color",            l_plugin_set_text_color },
+    { "set_launcher_layout",       l_plugin_set_launcher_layout },
+    { "refresh_theme",             l_plugin_refresh_theme },
+    { "reload_ui",                 l_plugin_reload_ui },
+    { "eq_load_profile",           l_plugin_eq_load_profile },
+    { "eq_save_profile",           l_plugin_eq_save_profile },
+    { "eq_reset",                  l_plugin_eq_reset },
+    { "eq_set_bypass",             l_plugin_eq_set_bypass },
+    { "eq_set_preamp",             l_plugin_eq_set_preamp },
+    { "eq_set_band",               l_plugin_eq_set_band },
+    { "eq_set_band_type",          l_plugin_eq_set_band_type },
+    { "eq_set_band_enabled",       l_plugin_eq_set_band_enabled },
+    { "set_hw_volume_curve",       l_plugin_set_hw_volume_curve },
+    { "toggle_pause",              l_plugin_toggle_pause },
+    { "stop",                      l_plugin_stop },
+    { "next_track",                l_plugin_next_track },
+    { "prev_track",                l_plugin_prev_track },
+    { "seek",                      l_plugin_seek },
+    { "set_transport_skip",        l_plugin_set_transport_skip },
+    { "set_volume",                l_plugin_set_volume },
+    { "get_volume",                l_plugin_get_volume },
+    { "get_battery",               l_plugin_get_battery },
+    { "is_playing",                l_plugin_is_playing },
+    { "is_paused",                 l_plugin_is_paused },
+    { "get_position",              l_plugin_get_position },
+    { "get_duration",              l_plugin_get_duration },
+    { "http_get",                  l_plugin_http_get },
+    { "http_post",                 l_plugin_http_post },
+    { "http_request",              l_plugin_http_request },
+    { "download_file_async",       l_plugin_download_file_async },
+    { "cancel",                    l_plugin_cancel },
+    { "md5",                       l_plugin_md5 },
+    { "json_decode",               l_plugin_json_decode },
+    { "json_encode",               l_plugin_json_encode },
+    { "media_capabilities",        l_plugin_media_capabilities },
+    { "show_text_input",           l_plugin_show_text_input },
+    { "get_now_playing",           l_plugin_get_now_playing },
+    { "get_play_mode",             l_plugin_get_play_mode },
+    { "get_current_track_path",    l_plugin_get_current_track_path },
+    { "get_artist_albums",         l_plugin_get_artist_albums },
+    { "get_album_tracks",          l_plugin_get_album_tracks },
+    { "get_next_album_tracks",     l_plugin_get_next_album_tracks },
+    { "library_song_count",        l_plugin_library_song_count },
+    { "library_get_songs",         l_plugin_library_get_songs },
+    { "library_search",            l_plugin_library_search },
+    { "library_get_song",          l_plugin_library_get_song },
+    { "library_get_artists",       l_plugin_library_get_artists },
+    { "library_get_albums",        l_plugin_library_get_albums },
+    { "refresh_library",           l_plugin_refresh_library },
+    { "on",                        l_plugin_on },
+    { "set_interval",              l_plugin_set_interval },
+    { "clear_interval",            l_plugin_clear_interval },
+    { "image_thumbnail_async",     l_plugin_image_thumbnail_async },
+    { "show_text_view",            l_plugin_show_text_view },
+    { "show_details",              l_plugin_show_details },
+    { NULL, NULL }
+};
+
+static const luaL_Reg plugin_storage_funcs[] = {
+    { "get",    l_plugin_storage_get },
+    { "set",    l_plugin_storage_set },
+    { "delete", l_plugin_storage_delete },
+    { "list",   l_plugin_storage_list },
+    { NULL, NULL }
+};
+
+static const luaL_Reg plugin_secrets_funcs[] = {
+    { "get",    l_plugin_secrets_get },
+    { "set",    l_plugin_secrets_set },
+    { "exists", l_plugin_secrets_exists },
+    { "delete", l_plugin_secrets_delete },
+    { NULL, NULL }
+};
+
+#define PLUGIN_CALL_MAX_MS 2000
+/* One second of grace past the soft budget. A well-behaved plugin sees the
+ * catchable luaL_error at PLUGIN_CALL_MAX_MS and unwinds; a plugin that keeps
+ * running past this (e.g. by wrapping its loop body in its own pcall() and
+ * swallowing that error) is hard-aborted via longjmp so it cannot pin the UI
+ * thread indefinitely. */
+#define PLUGIN_CALL_HARD_MS 3000
+
+static struct timespec plugin_call_deadline_start;
+static jmp_buf plugin_call_abort_jmp;
+static volatile int plugin_call_abort_armed = 0;
+
+/* Adds time spent executing inside native C functions to the deadline start. */
+static void plugin_call_exclude_native_elapsed(const struct timespec * started) {
+    struct timespec ended;
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    time_t sec = ended.tv_sec - started->tv_sec;
+    long nsec = ended.tv_nsec - started->tv_nsec;
+    if (nsec < 0) { sec--; nsec += 1000000000L; }
+    plugin_call_deadline_start.tv_sec += sec;
+    plugin_call_deadline_start.tv_nsec += nsec;
+    if (plugin_call_deadline_start.tv_nsec >= 1000000000L) {
+        plugin_call_deadline_start.tv_sec++;
+        plugin_call_deadline_start.tv_nsec -= 1000000000L;
+    }
+}
+
+/* Invoke a plain native Lua function through a protected boundary so its
+ * elapsed time is excluded on both success and luaL_error(). */
+static int plugin_call_native(lua_State * L, lua_CFunction fn) {
+    int nargs = lua_gettop(L);
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    lua_pushcfunction(L, fn);
+    lua_insert(L, 1);
+    int rc = lua_pcall(L, nargs, LUA_MULTRET, 0);
+    plugin_call_exclude_native_elapsed(&started);
+    if (rc != LUA_OK) return lua_error(L);
+    return lua_gettop(L);
+}
+
+/* Wraps one plugin.* C function so native elapsed time is excluded even
+ * when the inner function luaL_error()s (lua_pcall here catches that,
+ * accounts, then rethrows). Without this, a long set_icon/http_get would
+ * return to Lua with the original plugin_call() deadline already expired
+ * and the next instruction-count hook would abort the whole plugin --
+ * a theme plugin may copy ~140 icons at load via set_icon(), so that abort
+ * looked like "the theme plugin didn't load" after a flash wiped
+ * /usr/data/theme_overrides/. */
+static int l_plugin_api_guard(lua_State * L) {
+    return plugin_call_native(L, lua_tocfunction(L, lua_upvalueindex(1)));
+}
+
+static void register_plugin_lib(lua_State * L, const luaL_Reg * regs) {
+    lua_newtable(L);
+    for (; regs->name != NULL; regs++) {
+        lua_pushcfunction(L, regs->func);
+        lua_pushcclosure(L, l_plugin_api_guard, 1);
+        lua_setfield(L, -2, regs->name);
+    }
+}
+
+static void register_plugin_api(lua_State * L) {
+    register_plugin_lib(L, plugin_funcs);
+    register_plugin_lib(L, plugin_storage_funcs);
+    lua_setfield(L, -2, "storage");
+    register_plugin_lib(L, plugin_secrets_funcs);
+    lua_setfield(L, -2, "secrets");
+    lua_setglobal(L, "plugin");
+}
+
+/* Sandboxes the Lua state by removing shell execution (os.execute, io.popen),
+ * dynamic code loading (load, dofile, require), and debug library access.
+ * Retains basic file I/O operations needed by plugins. */
+
+/* Wrappers preventing direct access to reserved plugin storage paths
+ * (plugin_storage_path_is_reserved) via standard io and os library functions. */
+static lua_CFunction real_io_open = NULL;
+static lua_CFunction real_io_lines = NULL;
+static lua_CFunction real_io_input = NULL;
+static lua_CFunction real_io_output = NULL;
+static lua_CFunction real_os_remove = NULL;
+static lua_CFunction real_os_rename = NULL;
+
+static int l_guarded_io_open(lua_State * L) {
+    const char * path = luaL_optstring(L, 1, "");
+    const char * mode = luaL_optstring(L, 2, "r");
+    if (plugin_storage_path_is_reserved(path)) {
+        return push_plugin_error(L, "io.open: path is reserved (player settings, plugin.storage, plugin.secrets)");
+    }
+    if (strpbrk(mode, "wa+") && plugin_path_in_install_root(path)) {
+        return push_plugin_error(L, "io.open: " INSTALL_ROOT_READ_ONLY);
+    }
+    return plugin_call_native(L, real_io_open);
+}
+
+static int l_guarded_io_lines(lua_State * L) {
+    /* io.lines(), with no argument, reads the default input -- not a path,
+     * nothing to check. Unlike io.open(), a real io.lines() failure
+     * raises a Lua error rather than returning nil+message (per the Lua
+     * manual), so this mirrors that convention instead of io.open()'s. */
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        const char * path = lua_tostring(L, 1);
+        if (plugin_storage_path_is_reserved(path)) {
+            return luaL_error(L, "io.lines: path is reserved (player settings, plugin.storage, plugin.secrets)");
+        }
+    }
+    return plugin_call_native(L, real_io_lines);
+}
+
+static int l_guarded_io_input(lua_State * L) {
+    /* Only a STRING first argument names a path to open -- io.input() with
+     * no argument returns the current default input, and io.input(handle)
+     * with an already-open file handle just re-points the default input
+     * at it, neither of which is a path to check. Like io.lines(), a real
+     * io.input() failure raises a Lua error rather than returning
+     * nil+message. */
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        const char * path = lua_tostring(L, 1);
+        if (plugin_storage_path_is_reserved(path)) {
+            return luaL_error(L, "io.input: path is reserved (player settings, plugin.storage, plugin.secrets)");
+        }
+    }
+    return plugin_call_native(L, real_io_input);
+}
+
+static int l_guarded_io_output(lua_State * L) {
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        const char * path = lua_tostring(L, 1);
+        if (plugin_storage_path_is_reserved(path)) {
+            return luaL_error(L, "io.output: path is reserved (player settings, plugin.storage, plugin.secrets)");
+        }
+        if (plugin_path_in_install_root(path)) return luaL_error(L, "io.output: " INSTALL_ROOT_READ_ONLY);
+    }
+    return plugin_call_native(L, real_io_output);
+}
+
+static int l_guarded_os_remove(lua_State * L) {
+    const char * path = luaL_optstring(L, 1, "");
+    if (plugin_storage_path_is_reserved(path)) {
+        return push_plugin_error(L, "os.remove: path is reserved (player settings, plugin.storage, plugin.secrets)");
+    }
+    if (plugin_path_in_install_root(path)) return push_plugin_error(L, "os.remove: " INSTALL_ROOT_READ_ONLY);
+    return plugin_call_native(L, real_os_remove);
+}
+
+static int l_guarded_os_rename(lua_State * L) {
+    const char * from = luaL_optstring(L, 1, "");
+    const char * to = luaL_optstring(L, 2, "");
+    /* Also refused: renaming an ancestor of a reserved tree (".mellowtone"
+     * itself), which would move the whole tree out from under the check. */
+    if (plugin_storage_path_holds_reserved(from) || plugin_storage_path_holds_reserved(to)) {
+        return push_plugin_error(L, "os.rename: path is reserved (player settings, plugin.storage, plugin.secrets)");
+    }
+    if (plugin_path_in_install_root(from) || plugin_path_in_install_root(to))
+        return push_plugin_error(L, "os.rename: " INSTALL_ROOT_READ_ONLY);
+    return plugin_call_native(L, real_os_rename);
+}
+
+static void sandbox_plugin_lua_state(lua_State * L) {
+    lua_pushnil(L); lua_setglobal(L, "load");
+    lua_pushnil(L); lua_setglobal(L, "loadstring");
+    lua_pushnil(L); lua_setglobal(L, "loadfile");
+    lua_pushnil(L); lua_setglobal(L, "dofile");
+    lua_pushnil(L); lua_setglobal(L, "require");
+    lua_pushnil(L); lua_setglobal(L, "package");
+    lua_pushnil(L); lua_setglobal(L, "debug");
+
+    lua_getglobal(L, "os");
+    if (lua_istable(L, -1)) {
+        static const char * dangerous_os[] = { "execute", "getenv", "exit", "tmpname" };
+        for (size_t i = 0; i < sizeof(dangerous_os) / sizeof(dangerous_os[0]); i++) {
+            lua_pushnil(L);
+            lua_setfield(L, -2, dangerous_os[i]);
+        }
+
+        lua_getfield(L, -1, "remove");
+        if (lua_iscfunction(L, -1)) real_os_remove = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "rename");
+        if (lua_iscfunction(L, -1)) real_os_rename = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        if (real_os_remove) { lua_pushcfunction(L, l_guarded_os_remove); lua_setfield(L, -2, "remove"); }
+        if (real_os_rename) { lua_pushcfunction(L, l_guarded_os_rename); lua_setfield(L, -2, "rename"); }
+    }
+    lua_pop(L, 1);
+
+    lua_getglobal(L, "io");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "popen"); /* the one io.* function that's a shell-exec primitive, not file I/O */
+
+        lua_getfield(L, -1, "open");
+        if (lua_iscfunction(L, -1)) real_io_open = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "lines");
+        if (lua_iscfunction(L, -1)) real_io_lines = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "input");
+        if (lua_iscfunction(L, -1)) real_io_input = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "output");
+        if (lua_iscfunction(L, -1)) real_io_output = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        if (real_io_open) { lua_pushcfunction(L, l_guarded_io_open); lua_setfield(L, -2, "open"); }
+        if (real_io_lines) { lua_pushcfunction(L, l_guarded_io_lines); lua_setfield(L, -2, "lines"); }
+        if (real_io_input) { lua_pushcfunction(L, l_guarded_io_input); lua_setfield(L, -2, "input"); }
+        if (real_io_output) { lua_pushcfunction(L, l_guarded_io_output); lua_setfield(L, -2, "output"); }
+    }
+    lua_pop(L, 1);
+}
+
+static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
+    (void) ar;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - plugin_call_deadline_start.tv_sec) * 1000L +
+                      (now.tv_nsec - plugin_call_deadline_start.tv_nsec) / 1000000L;
+    if (elapsed_ms > PLUGIN_CALL_HARD_MS && plugin_call_abort_armed) {
+        /* Jump straight out to plugin_call(), past any pcall the plugin itself
+         * installed. The catchable luaL_error below is not enough on its own:
+         * a plugin can wrap its work in pcall() and swallow it, so without this
+         * a runaway loop would keep the UI thread busy forever. The VM is at an
+         * instruction boundary here, so its stack is consistent for the
+         * cleanup plugin_call() does after catching this. */
+        plugin_call_abort_armed = 0;
+        longjmp(plugin_call_abort_jmp, 1);
+    }
+    if (elapsed_ms > PLUGIN_CALL_MAX_MS) {
+        luaL_error(L, "plugin call exceeded %dms time budget -- aborted to keep the UI responsive", PLUGIN_CALL_MAX_MS);
+    }
+}
+
+/* Drops every registration that would call back into L, without touching
+ * L itself: on a hard abort (L is frozen) and on a failed load (L is about
+ * to be closed). Intervals stop, in-flight HTTP and thumbnail jobs are
+ * cancelled and finish without a callback, and the slots of events, list
+ * callbacks, settings rows, the text input and text views are emptied.
+ * Rows and tiles on screens keep their place but do nothing once their
+ * state is unusable; a failed load registered them before any screen was
+ * built from them, so there (remove_rows) they are removed instead. */
+#define PLUGIN_REMOVE_ROWS(array, count, state)                                       \
+    do {                                                                              \
+        int kept_ = 0;                                                                \
+        for (int i_ = 0; i_ < (count); i_++)                                          \
+            if ((array)[i_].L != (state)) (array)[kept_++] = (array)[i_];            \
+        if (kept_ < (count))                                                          \
+            memset(&(array)[kept_], 0, sizeof((array)[0]) * (size_t) ((count) - kept_)); \
+        (count) = kept_;                                                              \
+    } while (0)
+
+static void plugin_forget_state(lua_State * L, bool remove_rows) {
+    if (!L) return;
+    for (int i = 0; i < PLUGIN_MAX_INTERVALS; i++) {
+        if (!plugin_intervals[i].active || plugin_intervals[i].L != L) continue;
+        plugin_intervals[i].active = false;
+        plugin_intervals[i].L = NULL;
+        gui_plugin_clear_interval(i);
+    }
+    for (int e = 0; e < PLUGIN_EVENT_COUNT; e++) {
+        for (int i = 0; i < plugin_event_subscriber_count[e]; i++) {
+            if (plugin_event_subscribers[e][i].L != L) continue;
+            plugin_event_subscribers[e][i].L = NULL;
+            plugin_event_subscribers[e][i].ref = LUA_NOREF;
+        }
+    }
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        plugin_async_http_t * req = &plugin_async_http[i];
+        if (!req->active || req->L != L) continue;
+        http_cancel_token_cancel(&req->cancel);
+        req->L = NULL;
+        req->callback_ref = LUA_NOREF;
+    }
+    if (plugin_image_thumb.active && plugin_image_thumb.L == L) {
+        atomic_store(&plugin_image_thumb.cancel, true);
+        plugin_image_thumb.L = NULL;
+        plugin_image_thumb.callback_ref = LUA_NOREF;
+    }
+    if (pending_text_input_L == L) {
+        pending_text_input_L = NULL;
+        pending_text_input_ref = LUA_NOREF;
+    }
+    for (int i = 0; i < TEXT_VIEW_CTX_MAX; i++) {
+        if (!text_view_ctxs[i].live || text_view_ctxs[i].L != L) continue;
+        text_view_ctxs[i].L = NULL;
+        text_view_ctxs[i].turn_ref = LUA_NOREF;
+        text_view_ctxs[i].close_ref = LUA_NOREF;
+    }
+    for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
+        if (plugin_list_callbacks[i].L != L) continue;
+        plugin_list_callbacks[i].L = NULL;
+        plugin_list_callbacks[i].select_ref = LUA_NOREF;
+    }
+    for (int s = 0; s < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; s++) {
+        for (int i = 0; i < plugin_settings_list_row_counts[s]; i++) {
+            if (plugin_settings_list_rows[s][i].L != L) continue;
+            plugin_settings_list_rows[s][i].L = NULL;
+            plugin_settings_list_rows[s][i].callback_ref = LUA_NOREF;
+        }
+    }
+    if (!remove_rows) return;
+    for (int t = 0; t < PLUGIN_LIST_TARGET_COUNT; t++)
+        PLUGIN_REMOVE_ROWS(plugin_list_items[t], plugin_list_item_counts[t], L);
+    PLUGIN_REMOVE_ROWS(plugin_stream_tiles, plugin_stream_tile_count, L);
+    PLUGIN_REMOVE_ROWS(plugin_quick_toggles, plugin_quick_toggle_count, L);
+}
+
+/* Executes a Lua protected call with a wall-clock timeout enforced by an
+ * instruction count hook. Time spent in native C functions is added to the
+ * deadline to avoid penalizing I/O. A plugin that blows past the hard budget
+ * (PLUGIN_CALL_HARD_MS) is longjmp-aborted from the hook, bypassing any pcall
+ * it installed, and permanently disabled -- its lua_State is left frozen and
+ * never run again. */
+static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
+    plugin_instance_t * inst = plugin_instance_for_state(L);
+    if (inst && inst->aborted) {
+        /* Callers check plugin_state_usable() first. Should one not, keep
+         * the frozen stack from growing: drop the function and its
+         * arguments before leaving the message the caller pops. */
+        lua_pop(L, nargs + 1);
+        lua_pushliteral(L, "plugin disabled after exceeding its time budget");
+        return LUA_ERRRUN;
+    }
+
+    /* Save/restore so a nested plugin_call (should one ever exist) can't lose
+     * the outer call's abort target or deadline. */
+    struct timespec saved_deadline = plugin_call_deadline_start;
+    int saved_armed = plugin_call_abort_armed;
+    lua_Hook saved_hook = lua_gethook(L);
+    int saved_hook_mask = lua_gethookmask(L);
+    int saved_hook_count = lua_gethookcount(L);
+    jmp_buf saved_jmp;
+    memcpy(saved_jmp, plugin_call_abort_jmp, sizeof(jmp_buf));
+
+    clock_gettime(CLOCK_MONOTONIC, &plugin_call_deadline_start);
+    lua_sethook(L, plugin_call_timeout_hook, LUA_MASKCOUNT, 10000);
+
+    int result;
+    if (setjmp(plugin_call_abort_jmp) == 0) {
+        plugin_call_abort_armed = 1;
+        result = lua_pcall(L, nargs, nresults, errfunc);
+    } else {
+        /* Hard-aborted from the hook. L is at a VM instruction boundary, so its
+         * stack pointers are consistent: reset the stack and leave a readable
+         * error for the caller's usual lua_tostring()/lua_pop(). Mark the
+         * plugin dead and never call back into this state -- it is deliberately
+         * not lua_close()d (a half-unwound VM), just frozen and leaked, the
+         * same lifetime every other plugin state already has in this file. */
+        if (inst) inst->aborted = true;
+        lua_settop(L, 0);
+        lua_pushliteral(L, "plugin call hard-aborted after exceeding its time budget");
+        result = LUA_ERRRUN;
+        plugin_forget_state(L, false);
+    }
+
+    /* Restores the enclosing call's hook when nested; otherwise clears it,
+     * so there is no cost between plugin calls. */
+    lua_sethook(L, saved_hook, saved_hook_mask, saved_hook_count);
+    plugin_call_abort_armed = saved_armed;
+    memcpy(plugin_call_abort_jmp, saved_jmp, sizeof(jmp_buf));
+    plugin_call_deadline_start = saved_deadline;
+    if (result != LUA_OK) release_plugin_led_override(L);
+    return result;
+}
+
+/* Discards failed plugin instance and rolls back staged hardware volume curve. */
+static void discard_failed_plugin_load(plugin_instance_t * inst, lua_State * L,
+                                        bool prev_curve_active, const uint8_t * prev_curve) {
+    audio_stage_custom_hw_volume_curve(prev_curve_active, prev_curve_active ? prev_curve : NULL);
+    release_plugin_led_override(L);
+    /* Top-level code may have registered callbacks before it failed. */
+    plugin_forget_state(L, true);
+    /* A hard-aborted state (load-time top-level code ran past the budget) was
+     * longjmp'd out of mid-execution; closing it could run finalizers on a
+     * half-unwound VM, so leave it frozen and leaked instead. */
+    if (!inst->aborted) lua_close(L);
+    memset(inst, 0, sizeof(*inst));
+    loading_plugin_slot = -1;
+}
+
+static void load_plugin_file(const char * path) {
+    const char * base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    size_t base_len = strlen(base);
+    if (base_len >= sizeof(plugin_instances[0].filename)) return; /* longer than any directory entry */
+    lua_State * L = luaL_newstate();
+    if (!L) return;
+    int slot = plugin_instance_count;
+    plugin_instance_t * inst = &plugin_instances[slot];
+    memset(inst, 0, sizeof(*inst));
+    inst->L = L;
+    memcpy(inst->filename, base, base_len + 1);
+    loading_plugin_slot = slot;
+    luaL_openlibs(L);
+    sandbox_plugin_lua_state(L);
+    register_plugin_api(L);
+
+    /* Snapshot staged hardware volume curve so it can be restored if this
+     * plugin fails to load. */
+    bool prev_curve_active;
+    uint8_t prev_curve[HW_VOLUME_CURVE_LEN];
+    audio_get_staged_hw_volume_curve_state(&prev_curve_active, prev_curve);
+
+    /* luaL_dofile(L, path)'s own expansion, with plugin_call() in place of
+     * a bare lua_pcall() -- top-level plugin code runs once here too, on
+     * the same UI thread as every other plugin_call() site, so it needs
+     * the same time budget (see plugin_call()'s own comment). */
+    if ((luaL_loadfile(L, path) || plugin_call(L, 0, LUA_MULTRET, 0)) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] failed to load %s: %s\n", path, err ? err : "unknown error");
+        discard_failed_plugin_load(inst, L, prev_curve_active, prev_curve);
+        return;
+    }
+
+    if (!inst->defined) {
+        snprintf(inst->id, sizeof(inst->id), "legacy.%.*s", (int) sizeof(inst->id) - 8, base);
+        char * dot = strrchr(inst->id, '.');
+        if (dot && strcasecmp(dot, ".lua") == 0) *dot = '\0';
+        /* If generated legacy ID collides with an existing plugin, append
+         * a deterministic 64-bit hash of the file path to disambiguate. */
+        if (plugin_id_collides(inst->id, slot)) {
+            uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a 64 */
+            for (const char * p = path; *p; p++) { h ^= (unsigned char) *p; h *= 0x100000001b3ULL; }
+            char base_no_ext[sizeof(inst->id)];
+            snprintf(base_no_ext, sizeof(base_no_ext), "%.*s", (int) sizeof(base_no_ext) - 1, base);
+            char * base_dot = strrchr(base_no_ext, '.');
+            if (base_dot && strcasecmp(base_dot, ".lua") == 0) *base_dot = '\0';
+            snprintf(inst->id, sizeof(inst->id), "legacy.%.*s.%016llx",
+                     (int) sizeof(inst->id) - 7 - 1 - 16 - 1, base_no_ext, (unsigned long long) h);
+            if (plugin_id_collides(inst->id, slot)) {
+                fprintf(stderr, "[plugins] refusing to load %s: generated id '%s' still collides with another plugin's id\n",
+                        path, inst->id);
+                discard_failed_plugin_load(inst, L, prev_curve_active, prev_curve);
+                return;
+            }
+        }
+        snprintf(inst->name, sizeof(inst->name), "%.*s", (int) sizeof(inst->name) - 1, base);
+        snprintf(inst->version, sizeof(inst->version), "0");
+        inst->defined = true;
+    }
+    loading_plugin_slot = -1;
+    plugin_instance_count++;
+}
+
+static int plugin_filename_cmp(const void * a, const void * b) {
+    return strcmp((const char *) a, (const char *) b);
+}
+
+/* Shared by plugin_manager_init() and plugin_manager_scan_available():
+ * returns a malloc'd, filename-sorted, UNBOUNDED array of every *.lua
+ * filename directly under <SD card>/.mellowtone/plugins/ (caller must free() it), and
+ * writes that directory's path into dir_path_out. Returns NULL (and sets
+ * *out_count to 0) if there's no plugins folder or no .lua files in it.
+ *
+ * Deliberately not capped at PLUGIN_MAX_FILES here -- both callers need to
+ * see the FULL on-disk list before applying their own separate cap
+ * (plugin_manager_init() only after filtering out disabled names, so a
+ * disabled file's load slot is actually reclaimed; plugin_manager_scan_available()
+ * Scans and sorts plugin filenames alphabetically to ensure deterministic load order. */
+static char (*scan_plugin_dir_sorted_names(char dir_path_out[600], int * out_count))[256] {
+    *out_count = 0;
+    snprintf(dir_path_out, 600, "%s", MT_PLUGINS_DIR);
+
+    DIR * d = opendir(dir_path_out);
+    if (!d) return NULL; /* no plugins folder -- nothing to do, not an error */
+
+    int total = 0;
+    struct dirent * ent;
+    while ((ent = readdir(d)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len < 5 || strcasecmp(ent->d_name + len - 4, ".lua") != 0) continue;
+        total++;
+    }
+    if (total == 0) {
+        closedir(d);
+        return NULL;
+    }
+
+    char (*names)[256] = malloc((size_t) total * sizeof(*names));
+    if (!names) {
+        closedir(d);
+        return NULL;
+    }
+
+    /* rewinddir(), not a second opendir() -- same DIR* handle, standard
+     * POSIX way to restart a directory stream already open. name_count is
+     * bounded by `total` from the pass above regardless of whether the
+     * directory's real contents shift between the two passes (a file
+     * added/removed concurrently) -- defensive, not expected in practice at
+     * this point in boot. */
+    rewinddir(d);
+    int name_count = 0;
+    while (name_count < total && (ent = readdir(d)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len < 5 || len >= sizeof(names[0]) || strcasecmp(ent->d_name + len - 4, ".lua") != 0) continue;
+        memcpy(names[name_count], ent->d_name, len + 1);
+        name_count++;
+    }
+    closedir(d);
+
+    qsort(names, (size_t) name_count, sizeof(names[0]), plugin_filename_cmp);
+    *out_count = name_count;
+    return names;
+}
+
+void plugin_manager_init(void) {
+    plugin_last_volume_percent = current_volume_percent();
+    plugin_disabled_list_load();
+
+    char dir_path[600];
+    int name_count = 0;
+    char (*names)[256] = scan_plugin_dir_sorted_names(dir_path, &name_count);
+    if (names) {
+        /* Filter disabled names out BEFORE the PLUGIN_MAX_FILES cap is
+         * applied, not after -- so disabling a plugin actually frees its
+         * slot for the next file in alphabetical order, rather than silently wasting
+         * a load slot on a file that isn't going to load anyway. */
+        int enabled_count = 0;
+        for (int i = 0; i < name_count; i++) {
+            if (plugin_disabled_list_contains(names[i])) continue;
+            if (enabled_count != i) memcpy(names[enabled_count], names[i], sizeof(names[0]));
+            enabled_count++;
+        }
+
+        int load_count = (enabled_count > PLUGIN_MAX_FILES) ? PLUGIN_MAX_FILES : enabled_count;
+        for (int i = 0; i < load_count; i++) {
+            if (plugin_instance_count >= PLUGIN_MAX_FILES) break;
+            char full_path[700];
+            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, names[i]);
+            load_plugin_file(full_path);
+        }
+        plugin_over_limit_count = 0;
+        for (int i = load_count; i < enabled_count && plugin_over_limit_count < PLUGIN_OVER_LIMIT_MAX; i++) {
+            plugin_over_limit[plugin_over_limit_count++] = plugin_filename_hash(names[i]);
+            fprintf(stderr, "[plugins] not loading %s: limit of %d plugins reached\n", names[i], PLUGIN_MAX_FILES);
+        }
+        free(names);
+    }
+    /* Exactly one hardware-volume-curve commit for the whole (re)load pass,
+     * reflecting whichever plugin (if any) called plugin.set_hw_volume_
+     * curve() during loading above, or the built-in taper if none did --
+     * unconditional (even when `names` was NULL/empty) so
+     * plugin_manager_deinit()'s own state-only clear always gets a
+     * matching final write. See audio_commit_hw_volume_curve()'s own
+     * comment in audio.h for why this needs to be a single deferred commit
+     * rather than each plugin.set_hw_volume_curve() call writing hardware
+     * immediately during this specific transaction. */
+    audio_commit_hw_volume_curve();
+}
+
+/* Fills `e` for `filename`, cross-referencing plugin_instances[] for its
+ * loaded state and (when loaded) its real display name. */
+static void fill_available_entry(plugin_available_entry_t * e, const char * filename) {
+    snprintf(e->filename, sizeof(e->filename), "%s", filename);
+    e->disabled = plugin_disabled_list_contains(filename);
+    e->loaded = false;
+    e->over_limit = false;
+    uint64_t h = plugin_filename_hash(filename);
+    for (int j = 0; j < plugin_over_limit_count; j++) {
+        if (plugin_over_limit[j] == h) {
+            e->over_limit = true;
+            break;
+        }
+    }
+    snprintf(e->display_name, sizeof(e->display_name), "%s", filename);
+
+    for (int j = 0; j < plugin_instance_count; j++) {
+        if (strcmp(plugin_instances[j].filename, filename) == 0) {
+            e->loaded = true;
+            snprintf(e->display_name, sizeof(e->display_name), "%s", plugin_instances[j].name);
+            break;
+        }
+    }
+}
+
+int plugin_manager_scan_available(plugin_available_entry_t * out, int max) {
+    char dir_path[600];
+    int name_count = 0;
+    char (*names)[256] = scan_plugin_dir_sorted_names(dir_path, &name_count);
+    if (!names) return 0;
+
+    int count = 0;
+    if (name_count <= max) {
+        /* Common case -- every file fits, plain alphabetical order. */
+        for (int i = 0; i < name_count; i++) fill_available_entry(&out[count++], names[i]);
+    } else {
+        /* More .lua files on disk than `max` can return. Guarantee every
+         * currently-LOADED plugin is still included -- there can only ever
+         * be PLUGIN_MAX_FILES of those, always <= max -- rather than
+         * truncating in pure alphabetical order and silently hiding an
+         * active plugin with no way to toggle it off from this list (real
+         * finding: N alphabetically-early disabled files would otherwise
+         * push a loaded, alphabetically-later one out of a naive cap).
+         * Loaded entries go first, then whatever budget remains is filled
+         * in alphabetical order -- sacrifices strict A-Z ordering only in
+         * this already-degenerate case. */
+        bool * included = calloc((size_t) name_count, sizeof(bool));
+        if (!included) { free(names); return 0; }
+
+        for (int i = 0; i < name_count && count < max; i++) {
+            bool is_loaded = false;
+            for (int j = 0; j < plugin_instance_count; j++) {
+                if (strcmp(plugin_instances[j].filename, names[i]) == 0) { is_loaded = true; break; }
+            }
+            if (is_loaded) {
+                fill_available_entry(&out[count++], names[i]);
+                included[i] = true;
+            }
+        }
+        for (int i = 0; i < name_count && count < max; i++) {
+            if (!included[i]) fill_available_entry(&out[count++], names[i]);
+        }
+        free(included);
+    }
+
+    free(names);
+    return count;
+}
+
+/* Forces every in-flight plugin.http_get_async()/download_file_async()
+ * request to finish before a UI reload closes the lua_State it belongs to
+ * -- see plugin_manager_deinit()'s own comment. http_cancel_token_cancel()
+ * is the same mechanism plugin.http_cancel() already uses to unwind a
+ * request early (shuts down the connection's fd so the worker thread wakes
+ * up and exits promptly rather than potentially blocking on I/O for the
+ * request's own timeout). Deliberately never invokes the Lua callback --
+ * plugin_manager_poll()'s own cancelled-request branch already skips it for
+ * the same reason (a cancelled request has nothing meaningful to report),
+ * and here the callback's L is about to be closed by the caller regardless. */
+static void plugin_manager_cancel_all_async_http(void) {
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        plugin_async_http_t * req = &plugin_async_http[i];
+        if (!req->active) continue;
+        http_cancel_token_cancel(&req->cancel);
+        pthread_join(req->thread, NULL);
+        if (plugin_state_usable(req->L)) luaL_unref(req->L, LUA_REGISTRYINDEX, req->callback_ref);
+        free(req->response_body);
+        req->response_body = NULL;
+        req->response_body_size = 0;
+        req->active = false;
+        atomic_store(&req->done, false);
+        http_cancel_token_destroy(&req->cancel);
+        req->L = NULL;
+        req->callback_ref = LUA_NOREF;
+    }
+}
+
+/* Counterpart to plugin_manager_init(), for an in-process UI reload
+ * (gui_reload.c) that needs to re-run every plugin's top-level script
+ * against freshly rebuilt screens -- plugin_manager_init() alone is not
+ * safe to call a second time: it would append new plugin_instances[]
+ * entries after the existing ones (never resetting plugin_instance_count)
+ * and leak every previous lua_State, which only this function closes.
+ *
+ * Order matters: background work referencing a plugin's L (async HTTP
+ * threads, interval timers, a pending text-input dialog) must be drained
+ * BEFORE that L is closed, or the next tick of plugin_manager_poll()/
+ * gui_plugin_clear_interval()'s own timer callback/plugin_manager_text_
+ * input_submitted() touches freed memory. Every list-item/tile/list-
+ * callback/settings-row/event-subscriber registry below is safe to just
+ * zero AFTER its owning plugin's L is closed -- every ref in them
+ * (luaL_ref) lives inside that same L, so closing it already frees the
+ * ref; explicit luaL_unref first is only needed for leak-freedom within a
+ * state that stays alive, which doesn't apply once it's about to be closed.
+ *
+ * Resets launcher_layout_config back to unconfigured state via
+ * gui_plugin_reset_launcher_layout() so removed or disabled plugins do not
+ * leave stale layouts in effect.
+ *
+ * Does NOT touch the shared theme style objects (screen_builders.c's
+ * style_theme_screen_bg/style_theme_card_bg/list_row_style/pill_row_bg_
+ * style/style_theme_text_primary/style_theme_text_muted) -- those are live
+ * style properties applied immediately by set_background_color()/set_text_
+ * color() (docs/PLUGINS.md: "safe to call at any time... no file/cache
+ * involved"), with no analogous "reverts if nothing re-calls" contract to
+ * honor; a reloaded plugin's own top-level code re-applies them the same
+ * as at a normal boot, same as before this change. Also does not touch
+ * PLUGIN_THEME_OVERRIDE_ROOT on disk -- that is exactly the icon-override
+ * state a reload exists to re-read, not something to clear. */
+/* Diagnostic logging for plugin deinitialization steps during reload. */
+static void deinit_diag(const char * step) {
+    if (!db_log_enabled()) return;
+    int fd = mt_log_open("reload_diag.log", O_WRONLY | O_CREAT | O_APPEND);
+    if (fd < 0) return;
+    char line[224];
+    int len = snprintf(line, sizeof(line), "[pid=%ld] %s\n", (long) getpid(), step);
+    if (len > 0) {
+        if (len >= (int) sizeof(line)) len = (int) sizeof(line) - 1;
+        write(fd, line, (size_t) len);
+        fsync(fd);
+    }
+    close(fd);
+}
+
+void plugin_manager_deinit(void) {
+    deinit_diag("plugin_manager_deinit: reset_launcher_layout before");
+    gui_plugin_reset_launcher_layout();
+    gui_player_set_transport_skip(NULL, 0);
+    plugin_led_override_owner = NULL;
+    led_control_clear_override();
+    led_control_apply(current_settings.led_indicator_enabled);
+    /* Same "in-process plugin config must not outlive the plugin" category
+     * as the two resets above -- without this, disabling/removing a Gain
+     * Mode-style plugin followed by a UI reload left its hardware volume
+     * curve active indefinitely, with no plugin left running to ever call
+     * plugin.set_hw_volume_curve(nil) itself. Stages the reset (NOT
+     * audio_set_custom_hw_volume_curve(NULL), which would touch the LIVE
+     * state directly and also write to hardware immediately) --
+     * plugin_manager_init() always runs right after this and installs +
+     * commits the real final value exactly once, see its own
+     * audio_commit_hw_volume_curve() call and
+     * audio_stage_custom_hw_volume_curve()'s own comment in audio.h for
+     * why this needs to stay on the separate staged state rather than the
+     * live one a concurrent volume request could still see. */
+    audio_stage_custom_hw_volume_curve(false, NULL);
+    deinit_diag("plugin_manager_deinit: cancel_all_async_http before");
+    plugin_manager_cancel_all_async_http();
+    plugin_image_thumb_cancel();
+    deinit_diag("plugin_manager_deinit: cancel_all_async_http after");
+
+    for (int i = 0; i < PLUGIN_MAX_INTERVALS; i++) {
+        if (!plugin_intervals[i].active) continue;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "plugin_manager_deinit: clearing interval slot %d before", i);
+        deinit_diag(msg);
+        if (plugin_state_usable(plugin_intervals[i].L))
+            luaL_unref(plugin_intervals[i].L, LUA_REGISTRYINDEX, plugin_intervals[i].ref);
+        plugin_intervals[i].active = false;
+        plugin_intervals[i].L = NULL;
+        gui_plugin_clear_interval(i); /* deletes the backing lv_timer_t -- see its own comment */
+    }
+
+    deinit_diag("plugin_manager_deinit: text_input_cancelled before");
+    plugin_manager_text_input_cancelled();
+
+    /* Deinit drops Lua refs without calling Lua callbacks; UI teardown
+     * already ran and discarded any pending on_close. */
+    for (int i = 0; i < TEXT_VIEW_CTX_MAX; i++) {
+        if (text_view_ctxs[i].live) text_view_ctx_release(&text_view_ctxs[i]);
+    }
+
+    /* A hard-aborted state is left frozen and leaked, as on a failed load:
+     * closing it could run finalizers on a half-unwound VM. */
+    for (int i = 0; i < plugin_instance_count; i++) {
+        if (plugin_instances[i].L && !plugin_instances[i].aborted) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "plugin_manager_deinit: lua_close slot %d id='%s' name='%s' before", i,
+                     plugin_instances[i].id, plugin_instances[i].name);
+            deinit_diag(msg);
+            lua_close(plugin_instances[i].L);
+        }
+    }
+    deinit_diag("plugin_manager_deinit: all lua_close done, memset before");
+    memset(plugin_instances, 0, sizeof(plugin_instances));
+    plugin_instance_count = 0;
+    plugin_over_limit_count = 0;
+
+    memset(plugin_list_items, 0, sizeof(plugin_list_items));
+    for (int i = 0; i < PLUGIN_LIST_TARGET_COUNT; i++) {
+        plugin_list_item_counts[i] = 0;
+    }
+    memset(plugin_stream_tiles, 0, sizeof(plugin_stream_tiles));
+    plugin_stream_tile_count = 0;
+    memset(plugin_quick_toggles, 0, sizeof(plugin_quick_toggles));
+    plugin_quick_toggle_count = 0;
+    memset(plugin_list_callbacks, 0, sizeof(plugin_list_callbacks));
+    memset(plugin_settings_list_rows, 0, sizeof(plugin_settings_list_rows));
+    memset(plugin_settings_list_row_counts, 0, sizeof(plugin_settings_list_row_counts));
+    memset(plugin_event_subscriber_count, 0, sizeof(plugin_event_subscriber_count));
+}
+
+void plugin_manager_poll(void) {
+    plugin_image_thumb_poll();
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        plugin_async_http_t * req = &plugin_async_http[i];
+        if (!req->active || !atomic_load(&req->done)) continue;
+        pthread_join(req->thread, NULL);
+
+        /* A plugin aborted while the request ran: no callback, no unref. */
+        lua_State * L = req->L;
+        if (plugin_state_usable(L) && !http_cancel_token_is_cancelled(&req->cancel)) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, req->callback_ref);
+            int callback_args;
+            if (req->is_download) {
+                if (req->ok) {
+                    lua_pushstring(L, req->dest_path);
+                    lua_pushnil(L);
+                } else {
+                    lua_pushnil(L);
+                    lua_pushstring(L, "download failed");
+                }
+                callback_args = 2;
+            } else if (req->ok) {
+                lua_pushinteger(L, req->status);
+                lua_pushlstring(L, req->response_body ? (const char *) req->response_body : "",
+                                req->response_body_size);
+                lua_pushnil(L);
+                /* New 4th argument: {Name = "value", ...} response
+                 * headers. An existing 3-parameter callback is completely
+                 * unaffected -- Lua silently drops extra arguments a
+                 * function doesn't declare. A repeated header name keeps
+                 * only the last occurrence (documented in docs/PLUGINS.md). */
+                lua_newtable(L);
+                for (int h = 0; h < req->response_header_count; h++) {
+                    lua_pushstring(L, req->response_headers[h].value);
+                    lua_setfield(L, -2, req->response_headers[h].name);
+                }
+                callback_args = 4;
+            } else {
+                lua_pushnil(L);
+                lua_pushnil(L);
+                /* req->response_error is one of http_client.h's stable
+                 * HTTP_ERR_* strings (e.g. "connect_timeout", "cancelled",
+                 * "response_too_large") when http_request_ex() set it --
+                 * more specific than the previous single generic message.
+                 * Still falls back to that generic message for the rare
+                 * case nothing set it (shouldn't happen, but a plugin
+                 * should never see a NULL/empty error string here). */
+                lua_pushstring(L, (req->response_error && req->response_error[0])
+                                      ? req->response_error : "network error or response limit exceeded");
+                callback_args = 3;
+            }
+            if (plugin_call(L, callback_args, 0, 0) != LUA_OK) {
+                const char * err = lua_tostring(L, -1);
+                fprintf(stderr, "[plugins] HTTP callback error: %s\n", err ? err : "unknown error");
+                lua_pop(L, 1);
+            }
+        }
+
+        /* The callback itself may have aborted the plugin. */
+        if (plugin_state_usable(L)) luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
+        free(req->response_body);
+        req->response_body = NULL;
+        req->response_body_size = 0;
+        req->active = false;
+        atomic_store(&req->done, false);
+        http_cancel_token_destroy(&req->cancel);
+        req->L = NULL;
+        req->callback_ref = LUA_NOREF;
+    }
+}
+
+bool plugin_manager_has_background_work(void) {
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++)
+        if (plugin_async_http[i].active) return true;
+    return plugin_image_thumb.active;
+}
+
+/* Shared by plugin_manager_settings_list_item_clicked()/_display_list_item_
+ * clicked() below -- kind is just for the stderr message ("settings list
+ * item"/"display list item"), so a load-time error in one plugin's row is
+ * distinguishable from another's in the log. */
+static void dispatch_list_item_open(plugin_list_item_t * item, const char * kind) {
+    lua_State * L = item->L;
+    if (!plugin_state_usable(L)) return;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, item->open_ref);
+    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] %s '%s' on_open error: %s\n", kind, item->label, err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+/* Shared by every plugin_manager_get_*_list_item_options() below --
+ * translates a plugin_list_item_t's empty-string "unset" convention back to
+ * NULL, matching what screen_builders.c's pill_row_apply_icon()/
+ * pill_row_resolve_text_size() already expect. Out-of-range index leaves
+ * every out param at its "unset" value, same tolerance every other
+ * out-of-range accessor in this family already has. */
+static void get_list_item_options(const plugin_list_item_t * array, int count, int index, const char ** out_icon,
+                                   int32_t * out_height, int32_t * out_width, const char ** out_text_size) {
+    *out_icon = NULL;
+    *out_height = 0;
+    *out_width = 0;
+    *out_text_size = NULL;
+    if (index < 0 || index >= count) return;
+
+    const plugin_list_item_t * item = &array[index];
+    if (item->icon_path[0]) *out_icon = item->icon_path;
+    *out_height = item->row_height;
+    *out_width = item->row_width;
+    if (item->text_size[0]) *out_text_size = item->text_size;
+}
+
+static int generic_list_item_count(int target) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) return 0;
+    return plugin_list_item_counts[target];
+}
+
+static const char * generic_list_item_label(int target, int index) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) return "";
+    if (index < 0 || index >= plugin_list_item_counts[target] || index >= plugin_list_targets[target].max_items) return "";
+    return plugin_list_items[target][index].label;
+}
+
+const char * plugin_manager_get_list_item_group(const char * list_id, int index) {
+    if (!list_id) return NULL;
+    for (int target = 0; target < PLUGIN_LIST_TARGET_COUNT; target++) {
+        if (strcmp(list_id, plugin_list_targets[target].list_id) != 0) continue;
+        if (index < 0 || index >= plugin_list_item_counts[target] || index >= plugin_list_targets[target].max_items) return NULL;
+        const char * group = plugin_list_items[target][index].group;
+        return group[0] ? group : NULL;
+    }
+    return NULL;
+}
+
+static void generic_list_item_clicked(int target, int index) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) return;
+    if (index < 0 || index >= plugin_list_item_counts[target] || index >= plugin_list_targets[target].max_items) return;
+    dispatch_list_item_open(&plugin_list_items[target][index], plugin_list_targets[target].kind);
+}
+
+static void generic_list_item_options(int target, int index, const char ** out_icon, int32_t * out_height,
+                                      int32_t * out_width, const char ** out_text_size) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) {
+        *out_icon = NULL;
+        *out_height = 0;
+        *out_width = 0;
+        *out_text_size = NULL;
+        return;
+    }
+    int count = plugin_list_item_counts[target];
+    if (count > plugin_list_targets[target].max_items) {
+        count = plugin_list_targets[target].max_items;
+    }
+    get_list_item_options(plugin_list_items[target], count, index, out_icon, out_height, out_width, out_text_size);
+}
+
+
+int plugin_manager_get_settings_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_SETTINGS); }
+const char * plugin_manager_get_settings_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_SETTINGS, index); }
+void plugin_manager_settings_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_SETTINGS, index); }
+void plugin_manager_get_settings_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_SETTINGS, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_display_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_DISPLAY); }
+const char * plugin_manager_get_display_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_DISPLAY, index); }
+void plugin_manager_display_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_DISPLAY, index); }
+void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_DISPLAY, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_playback_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_PLAYBACK); }
+const char * plugin_manager_get_playback_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_PLAYBACK, index); }
+void plugin_manager_playback_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_PLAYBACK, index); }
+void plugin_manager_get_playback_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_PLAYBACK, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_music_audio_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_AUDIO); }
+const char * plugin_manager_get_music_audio_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_AUDIO, index); }
+void plugin_manager_music_audio_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_AUDIO, index); }
+void plugin_manager_get_music_audio_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_AUDIO, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_music_controls_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_CONTROLS); }
+const char * plugin_manager_get_music_controls_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_CONTROLS, index); }
+void plugin_manager_music_controls_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_CONTROLS, index); }
+void plugin_manager_get_music_controls_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_CONTROLS, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_music_timers_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_TIMERS); }
+const char * plugin_manager_get_music_timers_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_TIMERS, index); }
+void plugin_manager_music_timers_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_TIMERS, index); }
+void plugin_manager_get_music_timers_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_TIMERS, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_developer_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_DEVELOPER); }
+const char * plugin_manager_get_developer_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_DEVELOPER, index); }
+void plugin_manager_developer_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_DEVELOPER, index); }
+void plugin_manager_get_developer_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_DEVELOPER, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_radio_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_RADIO); }
+const char * plugin_manager_get_radio_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_RADIO, index); }
+void plugin_manager_radio_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_RADIO, index); }
+
+int plugin_manager_get_music_library_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_LIBRARY); }
+const char * plugin_manager_get_music_library_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_LIBRARY, index); }
+void plugin_manager_music_library_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_LIBRARY, index); }
+void plugin_manager_get_music_library_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_LIBRARY, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_power_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_POWER); }
+const char * plugin_manager_get_power_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_POWER, index); }
+void plugin_manager_power_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_POWER, index); }
+void plugin_manager_get_power_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_POWER, index, out_icon, out_height, out_width, out_text_size); }
+
+int plugin_manager_get_system_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_SYSTEM); }
+const char * plugin_manager_get_system_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_SYSTEM, index); }
+void plugin_manager_system_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_SYSTEM, index); }
+void plugin_manager_get_system_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_SYSTEM, index, out_icon, out_height, out_width, out_text_size); }
+
+/* Shared by plugin_manager_stream_tile_clicked() below (the only remaining
+ * caller now that plugin_manager_tile_clicked() -- the old, single-slot
+ * dispatch -- is gone, replaced by the list-item registries above). */
+static void dispatch_tile_open(plugin_tile_t * t) {
+    lua_State * L = t->L;
+    if (!plugin_state_usable(L)) return;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, t->open_ref);
+    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] tile '%s' on_open error: %s\n", t->label, err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+int plugin_manager_get_stream_tile_count(void) {
+    return plugin_stream_tile_count;
+}
+
+const char * plugin_manager_get_stream_tile_label(int index) {
+    if (index < 0 || index >= plugin_stream_tile_count) return "";
+    return plugin_stream_tiles[index].label;
+}
+
+const char * plugin_manager_get_stream_tile_icon(int index) {
+    if (index < 0 || index >= plugin_stream_tile_count) return "stream_media/radio.png";
+    return plugin_stream_tiles[index].icon;
+}
+
+const char * plugin_manager_get_stream_tile_icon_selected(int index) {
+    if (index < 0 || index >= plugin_stream_tile_count) return "stream_media/radio_s.png";
+    return plugin_stream_tiles[index].icon_selected;
+}
+
+void plugin_manager_stream_tile_clicked(int index) {
+    if (index < 0 || index >= plugin_stream_tile_count) return;
+    dispatch_tile_open(&plugin_stream_tiles[index]);
+}
+
+int plugin_manager_get_quick_toggle_count(void) {
+    return plugin_quick_toggle_count;
+}
+
+int plugin_manager_find_quick_toggle_by_id(const char * id) {
+    return plugin_find_quick_toggle_by_id(id);
+}
+
+const char * plugin_manager_get_quick_toggle_label(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return "";
+    return plugin_quick_toggles[index].label;
+}
+
+const char * plugin_manager_get_quick_toggle_icon(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return "";
+    return plugin_quick_toggles[index].icon;
+}
+
+const char * plugin_manager_get_quick_toggle_icon_selected(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return "";
+    return plugin_quick_toggles[index].icon_selected;
+}
+
+const char * plugin_manager_get_quick_toggle_state_text(int index, bool on) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return on ? TR("On") : TR("Off");
+    return on ? plugin_quick_toggles[index].on_text : plugin_quick_toggles[index].off_text;
+}
+
+bool plugin_manager_get_quick_toggle_value(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return false;
+    return plugin_quick_toggles[index].value;
+}
+
+bool plugin_manager_quick_toggle_has_on_hold(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return false;
+    const plugin_quick_toggle_t * t = &plugin_quick_toggles[index];
+    return plugin_state_usable(t->L) && t->on_hold_ref != LUA_NOREF;
+}
+
+void plugin_manager_quick_toggle_set(int index, bool new_value) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return;
+    plugin_quick_toggle_t * t = &plugin_quick_toggles[index];
+    /* Stored before the call so a plugin that reads its own state back from
+     * inside on_change (or calls plugin.set_quick_toggle() there) sees the
+     * new value rather than the one it is replacing. */
+    t->value = new_value;
+    lua_State * L = t->L;
+    if (!plugin_state_usable(L) || t->change_ref == LUA_NOREF) return;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, t->change_ref);
+    lua_pushboolean(L, new_value);
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] quick toggle '%s' on_change error: %s\n", t->label, err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+bool plugin_manager_quick_toggle_open_settings(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return false;
+    plugin_quick_toggle_t * t = &plugin_quick_toggles[index];
+    lua_State * L = t->L;
+    if (!plugin_state_usable(L) || t->on_hold_ref == LUA_NOREF) return false;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, t->on_hold_ref);
+    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] quick toggle '%s' on_hold error: %s\n", t->label, err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+    return true;
+}
+
+void plugin_manager_list_item_selected(int slot, int index) {
+    if (slot < 0 || slot >= PLUGIN_LIST_SCREEN_POOL_SIZE) return;
+    plugin_list_callback_t * cb = &plugin_list_callbacks[slot];
+    lua_State * L = cb->L;
+    if (!plugin_state_usable(L) || cb->select_ref == LUA_NOREF) return;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, cb->select_ref);
+    lua_pushinteger(L, index + 1);
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] show_list on_select error: %s\n", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+/* Shared bounds check for the three plugin_manager_settings_list_*() below --
+ * out-of-range or never-populated is a silent no-op, same tolerance
+ * plugin_manager_list_item_selected() above has for "no show_list() call is
+ * current yet". */
+static bool settings_list_row_ref(int slot, int row, lua_State ** out_L, int * out_ref) {
+    if (slot < 0 || slot >= PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE) return false;
+    if (row < 0 || row >= plugin_settings_list_row_counts[slot]) return false;
+    plugin_settings_list_row_ref_t * r = &plugin_settings_list_rows[slot][row];
+    if (!plugin_state_usable(r->L)) return false;
+    *out_L = r->L;
+    *out_ref = r->callback_ref;
+    return true;
+}
+
+void plugin_manager_settings_list_row_selected(int slot, int row) {
+    lua_State * L;
+    int ref;
+    if (!settings_list_row_ref(slot, row, &L, &ref)) return;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] show_settings_list on_select error: %s\n", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+void plugin_manager_settings_list_toggled(int slot, int row, bool new_value) {
+    lua_State * L;
+    int ref;
+    if (!settings_list_row_ref(slot, row, &L, &ref)) return;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    lua_pushboolean(L, new_value);
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] show_settings_list on_change error: %s\n", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+void plugin_manager_settings_list_slid(int slot, int row, int new_value) {
+    lua_State * L;
+    int ref;
+    if (!settings_list_row_ref(slot, row, &L, &ref)) return;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    lua_pushinteger(L, new_value);
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] show_settings_list on_change error: %s\n", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+void plugin_manager_notify_track_started(const char * title, const char * artist, const char * album,
+                                          double duration_seconds, const char * provider, const char * track_id) {
+    for (int i = 0; i < plugin_event_subscriber_count[PLUGIN_EVENT_TRACK_STARTED]; i++) {
+        plugin_event_subscriber_t * sub = &plugin_event_subscribers[PLUGIN_EVENT_TRACK_STARTED][i];
+        lua_State * L = sub->L;
+        if (!plugin_state_usable(L)) continue;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, sub->ref);
+        lua_pushstring(L, title ? title : "");
+        lua_pushstring(L, artist ? artist : "");
+        lua_pushstring(L, album ? album : "");
+        lua_pushnumber(L, duration_seconds);
+        lua_pushstring(L, provider ? provider : "");
+        lua_pushstring(L, track_id ? track_id : "");
+        if (plugin_call(L, 6, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(L, -1);
+            fprintf(stderr, "[plugins] track_started handler error: %s\n", err ? err : "unknown error");
+            lua_pop(L, 1);
+        }
+    }
+}
+
+/* Shared by plugin_manager_notify_paused()/_resumed()/_stopped() below --
+ * the three zero-argument events. */
+static void notify_event_no_args(plugin_event_t idx, const char * kind) {
+    for (int i = 0; i < plugin_event_subscriber_count[idx]; i++) {
+        plugin_event_subscriber_t * sub = &plugin_event_subscribers[idx][i];
+        lua_State * L = sub->L;
+        if (!plugin_state_usable(L)) continue;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, sub->ref);
+        if (plugin_call(L, 0, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(L, -1);
+            fprintf(stderr, "[plugins] %s handler error: %s\n", kind, err ? err : "unknown error");
+            lua_pop(L, 1);
+        }
+    }
+}
+
+void plugin_manager_notify_paused(void) {
+    notify_event_no_args(PLUGIN_EVENT_PAUSED, "paused");
+}
+
+void plugin_manager_notify_resumed(void) {
+    notify_event_no_args(PLUGIN_EVENT_RESUMED, "resumed");
+}
+
+void plugin_manager_notify_stopped(void) {
+    notify_event_no_args(PLUGIN_EVENT_STOPPED, "stopped");
+}
+
+void plugin_manager_notify_screen_woke(void) {
+    notify_event_no_args(PLUGIN_EVENT_SCREEN_WOKE, "screen_woke");
+}
+
+void plugin_manager_notify_queue_exhausted(int direction) {
+    for (int i = 0; i < plugin_event_subscriber_count[PLUGIN_EVENT_QUEUE_EXHAUSTED]; i++) {
+        plugin_event_subscriber_t * sub = &plugin_event_subscribers[PLUGIN_EVENT_QUEUE_EXHAUSTED][i];
+        lua_State * L = sub->L;
+        if (!plugin_state_usable(L)) continue;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, sub->ref);
+        lua_pushnumber(L, direction);
+        if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(L, -1);
+            fprintf(stderr, "[plugins] queue_exhausted handler error: %s\n", err ? err : "unknown error");
+            lua_pop(L, 1);
+        }
+    }
+}
+
+void plugin_manager_notify_volume_changed(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    if (percent == plugin_last_volume_percent) return;
+    plugin_last_volume_percent = percent;
+
+    for (int i = 0; i < plugin_event_subscriber_count[PLUGIN_EVENT_VOLUME_CHANGED]; i++) {
+        plugin_event_subscriber_t * sub = &plugin_event_subscribers[PLUGIN_EVENT_VOLUME_CHANGED][i];
+        lua_State * L = sub->L;
+        if (!plugin_state_usable(L)) continue;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, sub->ref);
+        lua_pushinteger(L, percent);
+        if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(L, -1);
+            fprintf(stderr, "[plugins] volume_changed handler error: %s\n", err ? err : "unknown error");
+            lua_pop(L, 1);
+        }
+    }
+}
+
+static bool battery_info_equal(const plugin_battery_info_t * a, const plugin_battery_info_t * b) {
+    return a->level == b->level && a->charging == b->charging && a->full == b->full &&
+           a->external_power == b->external_power;
+}
+
+void plugin_manager_poll_battery(void) {
+    plugin_battery_info_t current = plugin_read_battery_info();
+    if (!plugin_battery_snapshot_valid) {
+        plugin_last_battery_info = current;
+        plugin_battery_snapshot_valid = true;
+        return;
+    }
+    if (battery_info_equal(&current, &plugin_last_battery_info)) return;
+    plugin_last_battery_info = current;
+
+    for (int i = 0; i < plugin_event_subscriber_count[PLUGIN_EVENT_BATTERY_CHANGED]; i++) {
+        plugin_event_subscriber_t * sub = &plugin_event_subscribers[PLUGIN_EVENT_BATTERY_CHANGED][i];
+        lua_State * L = sub->L;
+        if (!plugin_state_usable(L)) continue;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, sub->ref);
+        push_battery_info(L, &current);
+        if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(L, -1);
+            fprintf(stderr, "[plugins] battery_changed handler error: %s\n", err ? err : "unknown error");
+            lua_pop(L, 1);
+        }
+    }
+}
+
+void plugin_manager_notify_suspending(void) {
+    notify_event_no_args(PLUGIN_EVENT_SUSPENDING, "suspending");
+}
+
+void plugin_manager_notify_system_resumed(void) {
+    notify_event_no_args(PLUGIN_EVENT_SYSTEM_RESUMED, "system_resumed");
+}
+
+void plugin_manager_interval_fired(int slot) {
+    if (slot < 0 || slot >= PLUGIN_MAX_INTERVALS || !plugin_intervals[slot].active) return;
+
+    lua_State * L = plugin_intervals[slot].L;
+    if (!plugin_state_usable(L)) return;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, plugin_intervals[slot].ref);
+    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] set_interval callback error: %s\n", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+}
+
+void plugin_manager_text_input_submitted(const char * text) {
+    if (!pending_text_input_L || pending_text_input_ref == LUA_NOREF) return;
+
+    lua_State * L = pending_text_input_L;
+    int ref = pending_text_input_ref;
+    pending_text_input_L = NULL;
+    pending_text_input_ref = LUA_NOREF;
+    if (!plugin_state_usable(L)) return;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    lua_pushstring(L, text ? text : "");
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(L, -1);
+        fprintf(stderr, "[plugins] show_text_input on_submit error: %s\n", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
+    if (plugin_state_usable(L)) luaL_unref(L, LUA_REGISTRYINDEX, ref);
+}
+
+void plugin_manager_text_input_cancelled(void) {
+    if (!pending_text_input_L || pending_text_input_ref == LUA_NOREF) return;
+    if (plugin_state_usable(pending_text_input_L))
+        luaL_unref(pending_text_input_L, LUA_REGISTRYINDEX, pending_text_input_ref);
+    pending_text_input_L = NULL;
+    pending_text_input_ref = LUA_NOREF;
+}

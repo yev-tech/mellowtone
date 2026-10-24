@@ -1,0 +1,609 @@
+#ifndef SCREEN_BUILDERS_H
+#define SCREEN_BUILDERS_H
+
+#include "lvgl/lvgl.h"
+#include "board_config.h"
+#include "fallback_font.h"
+#include "launcher_layout.h"
+#include "gui_theme.h"
+#include <stdbool.h>
+
+/* Settings -> Font Size uses the stable fallback-capable app_font_* handles
+ * declared above, for fixed chrome and metadata alike. */
+
+/* Two screen layouts repeat across the real stock UI: an icon grid (Home
+ * launcher, Music/Wireless/Stream Media submenus) and a scrollable list of
+ * pill-shaped rows (System settings). Both builders are pure layout
+ * -- navigation (back button behavior, swipe gestures) is wired by the
+ * caller afterwards, same as every other screen in gui.c, so this module
+ * has no dependency on the nav stack. */
+
+/* Shared header-band heights -- every screen, including the hand-built ones
+ * in gui.c that don't go through a builder here (player, accent color, EQ,
+ * text entry, group songs, subsonic lists), reserves these so its own
+ * content never competes with the persistent status bar (clock/battery/
+ * wifi, drawn separately on lv_layer_top()) for the same pixels. */
+/* Clearance band height (32px) between the display top and screen headers.
+ * Topbar assets (clock, battery, wifi, codec badges) are 30px tall, leaving
+ * 1px margin above/below them. Consumers derive positions algebraically
+ * from this constant. */
+#define STATUS_BAR_CLEARANCE BOARD_SCALE_PX(32)
+#define TITLE_ROW_HEIGHT BOARD_SCALE_PX(64)
+#define HOME_INDICATOR_BAND_HEIGHT BOARD_SCALE_PX(24)
+#define HOME_INDICATOR_CONTENT_INSET (HOME_INDICATOR_BAND_HEIGHT + BOARD_SCALE_PX(8))
+
+/* Shared touch-list row geometry -- every tappable row-of-text list
+ * (Artists/Albums/Album Artist/Genres/All Songs/group-songs drill-down,
+ * Files, Wi-Fi/Bluetooth scan results, Subsonic browsing) uses these same
+ * dimensions for consistency. Rows use a rounded rect
+ * (LIST_ROW_BG_COLOR/LIST_ROW_RADIUS) with colors from the charcoal palette
+ * and support live plugin overrides. */
+int32_t ui_list_row_width(void);
+int32_t ui_list_row_width_wide(void);
+#define LIST_ROW_WIDTH (ui_list_row_width())
+/* Compatibility name used by roomier library lists. Both row-width helpers
+ * follow the active display width and intentionally add no outer gutter. */
+#define LIST_ROW_WIDTH_WIDE (ui_list_row_width_wide())
+#define LIST_ROW_HEIGHT BOARD_SCALE_PX(84)
+#define MUSIC_LIST_ROW_HEIGHT GUI_MUSIC_ROW_HEIGHT
+#define LIST_ROW_RADIUS BOARD_SCALE_PX(16)
+#define LIST_ROW_BG_COLOR lv_color_hex(GUI_COLOR_ROW)
+#define LIST_ROW_FONT app_font_22 /* see fallback_font.h -- same metrics as lv_font_montserrat_22, plus a non-Latin fallback */
+#define LIST_ROW_LABEL_INSET GUI_TEXT_INSET
+
+/* Shared lv_style_t for row-of-text lists (build_compact_list_screen,
+ * show_group_songs, populate_indexed_list). Using a shared style and
+ * merging row+label into a single clickable lv_label minimizes object
+ * count and construction overhead for large lists. pad_top is baked in
+ * to vertically center LIST_ROW_FONT text within LIST_ROW_HEIGHT.
+ * Call screen_builders_init_list_row_style() once before building any
+ * list screen (handled in gui_init()). */
+extern lv_style_t list_row_style;
+/* LV_STATE_PRESSED-only bg_color override for a list_row_style row -- attach
+ * with lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED),
+ * see screen_builders_init_list_row_style()'s own comment on why this is a
+ * separate style rather than folded into list_row_style itself. */
+extern lv_style_t list_row_pressed_style;
+/* Same live, plugin-mutable bg_color/radius as list_row_style, for pill rows
+ * (build_pill_list_screen()'s resized branch, add_pill_row_base()) that
+ * position every child themselves via fixed-offset lv_obj_align() calls --
+ * deliberately carries none of list_row_style's width/height/padding/text
+ * properties, since its pad_left/pad_top would shift the content-area
+ * origin lv_obj_align() aligns against, displacing those rows' labels/icons.
+ * gui_plugin_set_background_color() mutates this alongside list_row_style
+ * whenever the "list_row" slot changes -- see screen_builders_init_list_row_
+ * style()'s own comment. */
+extern lv_style_t pill_row_bg_style;
+/* Minimum touch/text clearance for native rows. Explicit plugin sizing
+ * removes this style rather than silently clamping the plugin's layout. */
+extern lv_style_t native_row_min_style;
+/* LV_STATE_PRESSED-only tap indicator for a bare lv_image icon button (no
+ * background to recolor the way list_row_pressed_style does) -- dims the
+ * icon via image_recolor/image_recolor_opa rather than swapping to a
+ * "_s" pressed-state asset, so it works uniformly regardless of which of an
+ * icon's several possible source images (play/pause, loop/random/single,
+ * favorited/not) happens to be showing right now. Attach with
+ * lv_obj_add_style(icon, &icon_press_style, LV_STATE_PRESSED) to any
+ * LV_OBJ_FLAG_CLICKABLE image -- LVGL enters/exits LV_STATE_PRESSED on its
+ * own during a touch, no event callback needed. */
+extern lv_style_t icon_press_style;
+
+/* Enables the shared constant-speed row marquee with a 2-second pause. */
+void row_label_enable_marquee(lv_obj_t * label);
+/* A secondary label belongs to its row, never intercepts taps, and is
+ * reused with the row pool. Legacy title\nmetadata strings remain valid. */
+lv_obj_t * row_label_create_subtitle(lv_obj_t * row);
+void row_label_set_identity(lv_obj_t * row, lv_obj_t * subtitle_label,
+                            const char * title, const char * subtitle, int32_t height);
+int32_t ui_music_row_height(void);
+/* Container rows shared by bounded playlist/queue pages. */
+lv_obj_t * build_music_list_row(lv_obj_t * parent, const char * title, const char * subtitle,
+                               int32_t trailing_space);
+/* Aligns a row's trailing status label to its metadata line, or to the title
+ * when the row has no subtitle. Alignment is recomputed after font changes. */
+void music_list_row_align_badge(lv_obj_t * row, lv_obj_t * badge);
+lv_obj_t * build_list_section(lv_obj_t * parent, const char * title);
+lv_obj_t * build_list_message(lv_obj_t * parent, const char * title, const char * detail);
+/* Sizes a bounded scrolling row label's own box tall enough for real glyph
+ * extents (descenders on p/q/g/y, etc.) instead of the font's bare
+ * lv_font_get_line_height() -- see this function's own definition
+ * (screen_builders.c) for why line_height alone isn't always enough and why
+ * this doesn't shift the label's existing on-screen vertical position.
+ * Tags the label (LV_OBJ_FLAG_USER_3) so screen_builders_refresh_font_
+ * geometry()'s one-shot walk can find and recompute this after a live font-
+ * tier change swaps the stable app_font_* descriptors in place. Called from
+ * configure_scrolling_row_label() (gui_plugins.c) -- the single shared
+ * construction path for every native pill row and every plugin/dynamic
+ * scrolling row -- never call this directly from a new call site instead of
+ * going through that. */
+void row_label_apply_bounded_height(lv_obj_t * label, const lv_font_t * font);
+int32_t row_label_bounded_height(const lv_font_t * font);
+/* Theming: shared, mutable bg_color styles for the app's other two
+ * "background categories" -- attach with lv_obj_add_style(x, &style_theme_screen_bg, 0)
+ * on every screen root, or &style_theme_card_bg on every popup/EQ-card/
+ * slider-card. Initialized with the native charcoal palette
+ * alongside list_row_style by screen_builders_init_list_row_style() below
+ * -- see its own comment for why these three specifically, and why not
+ * gui.c's style_accent. gui.c's gui_plugin_set_background_color() is what
+ * actually mutates these later, in response to a plugin's
+ * plugin.set_background_color() call. */
+extern lv_style_t style_theme_screen_bg;
+extern lv_style_t style_theme_card_bg;
+/* Same live-mutable-style mechanism, for text color instead of background:
+ * "primary" (the app's dominant near-white text -- labels, titles, list
+ * rows) and "muted" (secondary/disabled-ish gray text -- chevrons,
+ * timestamps, subtitles). Deliberately NOT covering destructive-red text
+ * (delete/reset confirmations) or accent-tinted text (already tracks the
+ * user's accent color pick independently) -- those are semantically fixed,
+ * not part of the light/dark background split. list_row_style's own
+ * text_color is a separate literal (not one of these two), since rows
+ * attach list_row_style directly rather than a second style object for
+ * text; gui.c's gui_plugin_set_text_color() mutates list_row_style's
+ * text_color too when slot is "primary" so rows stay in sync. */
+extern lv_style_t style_theme_text_primary;
+extern lv_style_t style_theme_text_muted;
+void screen_builders_init_list_row_style(void);
+
+typedef struct {
+    const char * icon_asset;          /* e.g. "launcher/music.png" */
+    const char * icon_asset_selected; /* "_s" variant, e.g. "launcher/music_s.png" */
+    const char * label;
+    lv_event_cb_t on_click;           /* fired on LV_EVENT_CLICKED, may be NULL */
+    void * user_data;
+} icon_grid_item_t;
+
+/* Top-right counterpart to build_header_back_button() --
+ * same 64x64 transparent hitbox, same STATUS_BAR_CLEARANCE vertical position,
+ * so any caller's icon lands at exactly the same visual level as the screen's
+ * own back arrow, mirrored to the right edge instead of the left. icon_asset
+ * is passed straight to lv_image_set_src() (caller resolves it via
+ * asset_path()/asset_path_plain() first, same as every other icon in this
+ * codebase). click_cb may be NULL for a purely decorative icon. */
+lv_obj_t * build_top_right_icon_button(lv_obj_t * scr, const char * icon_asset, lv_event_cb_t click_cb);
+/* Shared back control for screens that retain its handle to toggle visibility. */
+lv_obj_t * build_header_back_button(lv_obj_t * scr, lv_event_cb_t cb);
+/* Align existing text actions/switches by their actual height, not an
+ * assumed font or asset size. Position remains centered when size changes. */
+void align_screen_header_action(lv_obj_t * action, int32_t right_inset);
+/* Top-right refresh glyph (LV_SYMBOL_REFRESH, accent color) for list screens
+ * whose contents come from a cached scan; busy greys it out and blocks taps. */
+lv_obj_t * build_header_refresh_action(lv_obj_t * scr, lv_event_cb_t click_cb);
+void set_header_refresh_action_busy(lv_obj_t * icon, bool busy);
+/* Fits a header title built by build_screen_header() to its single line
+ * (smaller font, then ellipsis). Call again after changing its width. */
+void screen_title_fit(lv_obj_t * label);
+
+/* Returns the title label. Optional trailing action reserves its hitbox. */
+lv_obj_t * build_screen_header(lv_obj_t * scr, const char * title, lv_event_cb_t back_cb,
+                              const char * trailing_asset, lv_event_cb_t trailing_cb);
+
+typedef enum {
+    PILL_ACCESSORY_NONE = 0,
+    PILL_ACCESSORY_CHEVRON, /* no matching real asset found -- plain ">" label */
+    PILL_ACCESSORY_TOGGLE,  /* real lv_switch, standardized to match the Settings screen's own switches */
+} pill_accessory_type_t;
+
+typedef struct {
+    const char * label;
+    pill_accessory_type_t accessory;
+    bool toggle_initial_state;      /* only used when accessory == PILL_ACCESSORY_TOGGLE */
+    lv_event_cb_t on_click;         /* fired on row LV_EVENT_CLICKED (NONE/CHEVRON rows) */
+    lv_event_cb_t on_toggle_change; /* fired on LV_EVENT_VALUE_CHANGED (TOGGLE rows) */
+    void * user_data;
+    /* Optional (NULL if not needed): on a PILL_ACCESSORY_TOGGLE row,
+     * *out_toggle_img is set to the toggle's own lv_switch once built,
+     * allowing callers to update its LV_STATE_CHECKED state later from
+     * elsewhere (e.g. settings_crossfade_toggle_img in gui_settings.c). */
+    lv_obj_t ** out_toggle_img;
+
+    /* ---- Plugin-row extensions (plugin.register_list_item()'s optional
+     * `options` table, docs/PLUGINS.md) -- every existing native row across every
+     * build_pill_list_screen() caller leaves these NULL/0 (a plain compound
+     * literal without designators for trailing fields already defaults them
+     * that way), selecting native rounded surfaces, font-aware 84px
+     * minimum rows and app_font_20 labels. Only a
+     * plugin-appended row (gui.c's build_settings_*_screen() plugin-row
+     * loops) ever sets these. ---- */
+
+    /* Raw absolute filesystem path (e.g. MT_PLUGINS_DIR "/icon.png"),
+     * NOT a theme-relative asset path -- a plugin's icon lives on the SD
+     * card, not in this app's own theme directory. See pill_row_apply_icon()
+     * below. NULL = no icon, today's exact layout. */
+    const char * icon_asset;
+
+    /* 0 = native font-aware density. A non-zero value is clamped to
+     * PILL_ROW_HEIGHT_MIN..MAX and preserves explicit plugin sizing. */
+    int32_t row_height;
+
+    /* 0 = the native display width minus gutters. Non-zero values use the
+     * plugin-safe range below and keep the row centered in its list. */
+    int32_t row_width;
+
+    /* NULL = this call site's own default (native rows: app_font_20,
+     * unchanged; plugin rows: gui.c always supplies a non-NULL default
+     * before this reaches here -- see pill_row_resolve_text_size()'s own
+     * comment). "small"/"medium"/"large" -> app_font_16/22/28
+     * (fallback_font.h) -- the fallback-capable family, since plugin row
+     * text (unlike native chrome) may be non-Latin. Validated by the Lua
+     * boundary in plugin_manager.c; this layer trusts it's already one of
+     * the three recognized values or NULL. */
+    const char * text_size;
+
+    /* ---- Optional style overrides (plugin.set_launcher_layout()'s menu
+     * options, via build_category_menu_screen()) -- other rows leave these false/0,
+     * reproducing today's exact rendering. When has_bg_color/has_radius is
+     * set, the row is forced onto the same plain rounded-rect fill path
+     * row_height/row_width already use instead of the PNG pill sprite (a
+     * raster asset can't be recolored), using these values in place of
+     * LIST_ROW_BG_COLOR/LIST_ROW_RADIUS. ---- */
+    bool has_bg_color;   uint32_t bg_color;
+    bool has_text_color; uint32_t text_color;
+    bool has_radius;     int32_t radius;
+
+    /* NULL/"left" (default) = today's exact layout (label left-aligned,
+     * starting right after any icon -- unaffected by this field). "center"/
+     * "right" re-align the label alone within the row's own remaining width;
+     * pill_row_apply_icon()'s icon placement is never touched by this.
+     * plugin.set_launcher_layout() only (via build_category_menu_screen()). */
+    const char * text_align;
+    lv_obj_t ** out_row;
+} pill_list_item_t;
+
+/* Row-height bounds for a plugin-resized pill row (register_list_item()'s
+ * `height` option), a plugin-resized show_list() row (gui_plugin_show_list()'s
+ * own `height` option), or a plugin.set_launcher_layout() menu row
+ * (PLUGINS.md) -- shared range for all three, silently clamped rather than
+ * erroring (same convention plugin.set_interval()'s own minimum-clamp uses).
+ * Values below PILL_ROW_ICON_PX_DEFAULT (64px) allow compact rows.
+ * If a row has both an icon and a height
+ * below 64px, the icon will be clipped to row bounds; rows without icons
+ * are unaffected. PILL_ROW_HEIGHT_MAX prevents a single row from dominating
+ * the screen. */
+#define PILL_ROW_HEIGHT_MIN 48
+#define PILL_ROW_HEIGHT_MAX 220
+#define PILL_ROW_WIDTH_MIN 240
+#define PILL_ROW_WIDTH_MAX (ui_list_row_width_wide())
+
+/* Native width derived from the active display. */
+int32_t pill_row_default_width(void);
+
+/* On-screen icon footprint (longest edge, in px) a plugin row's icon
+ * targets. Fits the native 84px row with 10px clearance above and below. */
+#define PILL_ROW_ICON_PX_DEFAULT 64
+
+/* Adds a plugin-supplied icon to an already-built row and re-aligns `label`
+ * to start after it -- shared by build_pill_list_screen() below (native
+ * pill rows) and gui.c's own plugin-row builders (add_pill_row_base()'s
+ * pill-toggle/-chevron rows, the settings-list slider row, gui_plugin_
+ * show_list()'s icon rows), so the icon-loading/scaling logic exists in
+ * exactly one place rather than four. No-op if icon_path is NULL --
+ * `label`'s alignment is left completely untouched in that case, preserving
+ * every existing call site's exact layout. `icon_px` is the on-screen
+ * target size (longest edge); pass PILL_ROW_ICON_PX_DEFAULT unless a caller
+ * has a specific reason not to. `align`/`x`/`y` are the alignment to apply
+ * to BOTH the icon and (offset by icon_px + a 12px gap) the label -- most
+ * rows are a single vertically-centered line (LV_ALIGN_LEFT_MID), but the
+ * settings-list slider row's label sits top-left instead (its value label
+ * and slider fill the rest of the card), so this isn't hardcoded. See this
+ * file's own top-of-block comment for why icon_path is a raw filesystem
+ * path, not a theme-relative one. */
+void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_path, int32_t icon_px,
+                          lv_align_t align, int32_t x, int32_t y);
+
+/* Resolves a plugin's chosen text-size tier to the correspondingly-sized
+ * fallback-capable font -- NULL returns app_font_20 (build_pill_list_screen()'s
+ * own native-row default; every plugin call site is responsible for
+ * supplying its OWN non-NULL default -- e.g. "medium" -- before calling
+ * this, precisely so NULL unambiguously means "a genuine native row" here,
+ * never "a plugin row that happened not to set text_size"). "small"/
+ * "medium"/"large" -> &app_font_16/22/28 (fallback_font.h). Any other
+ * string (shouldn't happen -- plugin_manager.c validates at the Lua
+ * boundary) falls back to app_font_20 rather than dereferencing garbage. */
+const lv_font_t * pill_row_resolve_text_size(const char * text_size);
+
+/* Titled screen: real back-arrow button and a vertically scrollable list of
+ * touch_list/item_bg.png pill rows, each with a label and an optional
+ * right-side chevron or toggle. toggle_accent_style is applied (via
+ * lv_obj_add_style(), not read as a plain value) to every PILL_ACCESSORY_
+ * TOGGLE row's own lv_switch (LV_PART_INDICATOR|LV_STATE_CHECKED) -- a
+ * style pointer rather than a
+ * resolved lv_color_t like build_compact_list_widget()'s own
+ * now_playing_color, specifically because these pill-list screens are each
+ * built once at startup and never rebuilt (see e.g.
+ * build_timezone_region_screen()'s own comment), unlike the list screens
+ * now_playing_color feeds -- a plain color captured once here would go
+ * stale forever after the very next accent color change, where a shared,
+ * in-place-updated style (gui.c's style_accent, kept live via
+ * lv_obj_report_style_change()) doesn't. Caller owns the style object's
+ * lifetime; screen_builders.c never reads its properties directly, only
+ * attaches it (same "no visibility into gui.c's accent state" boundary as
+ * now_playing_color's own doc comment describes). */
+/* row_gap: vertical spacing between rows, in px (plugin.set_launcher_layout()'s
+ * row_gap reaches here through build_category_menu_screen()). */
+/* icon_scale_pct: scales every row's own icon (item->icon_asset); 100 =
+ * PILL_ROW_ICON_PX_DEFAULT (64px). */
+lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                   const pill_list_item_t * items, int item_count,
+                                   lv_style_t * toggle_accent_style, int32_t row_gap,
+                                   int32_t icon_scale_pct);
+
+/* Function pointer signatures matching plugin_manager_get_<target>_list_item_* accessors. */
+typedef int (*plugin_list_item_count_cb_t)(void);
+typedef const char * (*plugin_list_item_label_cb_t)(int index);
+typedef void (*plugin_list_item_options_cb_t)(int index, const char ** out_icon, int32_t * out_height,
+                                              int32_t * out_width, const char ** out_text_size);
+
+/* Appends up to max_items plugin-provided rows to items[] starting at index count,
+ * querying row metadata via the given get_count/get_label/get_options accessors and
+ * routing row clicks to click_cb with (void *)(intptr_t)index as user_data.
+ * Preserves the standard "medium" text_size fallback and chevron accessory styling.
+ * Returns the updated item count (count + rows appended). */
+int append_plugin_list_rows(pill_list_item_t * items, int count, int max_items,
+                            plugin_list_item_count_cb_t get_count_fn,
+                            plugin_list_item_label_cb_t get_label_fn,
+                            plugin_list_item_options_cb_t get_options_fn,
+                            lv_event_cb_t click_cb);
+
+/* Adds the Settings-style 44px icon and stretched pill background to an
+ * already-built native pill row. Both paths are theme-relative. Identical
+ * paths share one retained decoded buffer across rows/screens; it is released
+ * when the last referencing image is deleted. */
+void decorate_category_row(lv_obj_t * row, const char * icon_asset, const char * bg_asset);
+/* Adds a passive accent-colored Play All marker to an existing row and
+ * returns its circle so pooled label rows can realign it after padding changes. */
+lv_obj_t * decorate_play_all_row(lv_obj_t * row);
+
+/* Builds a Settings-style vertical category menu. Rows size themselves
+ * unless `layout` (plugin.set_launcher_layout(), may be NULL) overrides
+ * them. icon_asset paths are theme-relative. */
+lv_obj_t * build_category_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                      const icon_grid_item_t * items, int item_count,
+                                      const launcher_menu_layout_t * layout);
+
+typedef struct {
+    const char * label;
+    int64_t identity;              /* optional stable DB/item identity for row decorators */
+    const char * trailing_asset;   /* optional theme-relative badge asset */
+    const char * subtitle;         /* optional; same borrowed lifetime as label */
+    bool is_action;                /* explicit action affordance, not a song */
+    uint64_t artwork_key;           /* optional stable thumbnail key, separate from row identity */
+    const char * artwork_name;      /* optional artist name for artist-image resolution */
+} compact_list_item_t;
+
+/* Fixed size of a paged-mode row label buffer (compact_list_fetch_page_cb_t
+ * below) -- matches cached_tags_t.title's own size (metadata_db.h), the
+ * largest display string a paged provider actually needs to carry. */
+#define COMPACT_LIST_LABEL_MAX 384
+
+typedef struct {
+    char label[COMPACT_LIST_LABEL_MAX];
+    int64_t identity;
+    char trailing_asset[64];
+    char subtitle[256];
+    bool is_action;
+    uint64_t artwork_key;
+    char artwork_name[128];
+} compact_list_page_row_t;
+
+/* Fired when a row is tapped, with the index into the `items` array passed
+ * to build_compact_list_screen() -- not an lv_event_cb_t, since the
+ * virtualized row widgets underneath (see screen_builders.c) are reused
+ * across many different indices over the list's lifetime, so there's no
+ * single fixed LVGL event user_data to bind an index to at row-creation
+ * time the way a one-widget-per-item list could. */
+typedef void (*compact_list_click_cb_t)(int index);
+
+/* Titled screen: real back-arrow button and a vertically scrollable,
+ * virtualized list of compact 84px rows (no icon, no accessory -- just a
+ * label). Virtualized because a flat list can contain thousands of songs:
+ * only a small pool of row widgets exists at once, repositioned and
+ * relabeled as the list scrolls, avoiding the memory and layout overhead
+ * of allocating an LVGL object per song. `items` (and the strings its `label`
+ * pointers reference) must stay valid for the screen's entire lifetime --
+ * this function keeps its own copy of the `items` array itself (freed
+ * automatically when the screen is deleted), but not of the label strings
+ * themselves, matching how every existing caller already sources labels
+ * from long-lived backing arrays (song tags, artist/album group names)
+ * that only go away alongside a full library rescan, at which point these
+ * screens get torn down and rebuilt too. */
+/* on_long_press: fired on LV_EVENT_LONG_PRESSED, same index-resolution
+ * shape as on_click -- NULL for a list whose rows aren't individual songs
+ * (Artists/Albums/Album Artist name rows, the Time Zone city list), so
+ * there's nothing sensible to long-press into a context menu. Passed
+ * straight through to build_compact_list_widget() below. */
+/* out_title_label: NULL if the caller never needs to change the title text
+ * after construction (every existing caller so far) -- pass a real pointer
+ * only when the screen's title changes at runtime (e.g. a Subsonic list
+ * screen reused for different artists/albums, whose title reflects
+ * whichever one is currently shown). */
+lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                      const compact_list_item_t * items, int item_count,
+                                      compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
+                                      lv_obj_t ** out_list, lv_obj_t ** out_title_label, int32_t row_width,
+                                      bool enable_now_playing, lv_color_t now_playing_color);
+
+/* The virtualized list widget itself (what build_compact_list_screen()
+ * builds internally), with no screen/back-button/title wrapper -- for a
+ * caller that already has its own screen and wants to attach a compact
+ * list directly onto it (e.g. a search-results overlay layered on top of
+ * an existing screen's own UI). Returns the list object directly (not a
+ * screen) -- caller owns positioning it via lv_obj_align()/lv_obj_set_size().
+ * row_width overrides list_row_style's own LIST_ROW_WIDTH per-instance (pass
+ * LIST_ROW_WIDTH for the shared default, or LIST_ROW_WIDTH_WIDE to match a
+ * widened parent screen -- e.g. the Files search overlay matching Files'
+ * own now-wider rows). enable_now_playing/now_playing_color: see
+ * compact_list_set_now_playing()'s own doc comment below -- pass false/
+ * anything when a list has no now-playing concept (e.g. the Files search
+ * overlay, the timezone city list). Color is threaded through as a
+ * parameter rather than read directly (screen_builders.c has no visibility
+ * into gui.c's current_settings.accent_color/accent_lv_color()). */
+lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_t * items, int item_count,
+                                      compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
+                                      int32_t row_width, bool enable_now_playing, lv_color_t now_playing_color);
+
+/* Shows/moves/hides a thin accent-colored bar flush against the screen's
+ * far-left edge (independent of row_width/any row's own inset -- this is a
+ * "far left of the screen" indicator, not "far left of the row"), at the
+ * same y as the row for `item_index` (an index into whatever `items` array
+ * this list was built/last set with) -- item_index < 0 hides it. No-op if
+ * this list wasn't built with enable_now_playing=true. Position tracks the
+ * item directly (not the visible scroll window), so LVGL's own list
+ * scrolling/clipping naturally shows or hides it as the matching row
+ * scrolls in and out of view -- no separate scroll-event wiring needed. */
+void compact_list_set_now_playing(lv_obj_t * list, int item_index);
+
+/* Scrolls a build_compact_list_screen() list so item `index` lands at the
+ * top of the viewport -- exposed as a semantic helper (rather than exposing
+ * COMPACT_LIST_TOP_PAD/COMPACT_LIST_ROW_STRIDE themselves, private to
+ * screen_builders.c) so callers like gui.c's A-Z browse index don't need to
+ * know this list's internal row geometry. */
+void compact_list_scroll_to_index(lv_obj_t * list, int index);
+
+/* Swaps a build_compact_list_screen() list's contents in place -- used for
+ * live search filtering -- without the delete()+rebuild this project
+ * otherwise uses for changing a screen's list contents. */
+void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, int item_count);
+
+/* ---- Paged mode -- Rockbox-style DB-backed lists. An alternative to
+ * compact_list_set_items() for a list whose full content is too large to
+ * ever materialize at once (the local library's own All Songs/Artists/
+ * Albums/Album Artist screens): instead of a caller-owned items[] array,
+ * rows are fetched on demand, a bounded page at a time, from a callback --
+ * the list still only ever holds ~20 real LVGL row objects (same
+ * virtualization as eager mode), but now the underlying DATA is bounded
+ * too, not just the widget count. ---- */
+
+/* Fills out_labels[0..count) with the display label for logical rows
+ * [offset, offset+count) (0-indexed into the full, currently-sorted/
+ * filtered result set) -- e.g. a thin wrapper around metadata_db_get_
+ * songs_page()/get_groups_page() that formats each row's own display
+ * title/name into the fixed COMPACT_LIST_LABEL_MAX-sized buffer. Returns
+ * the number of rows actually written (less than `count` only at the very
+ * end of the result set -- ctx knows its own real total already via
+ * whatever populated it, this isn't how the list learns the total; see
+ * compact_list_set_paged_provider()'s own total_count argument for that).
+ * Called from the LVGL/main thread only (same thread every other compact_
+ * list callback runs on), so it's safe to call straight into metadata_db.c
+ * (its own METADATA_DB_GUARD) or any other main-thread-only state. */
+typedef int (*compact_list_fetch_page_cb_t)(void * ctx, int offset, int count,
+                                             compact_list_page_row_t out_rows[]);
+
+/* Optional visible-row decoration hook. Called only on the LVGL thread for
+ * the fixed recycled row pool. `leading_image` is owned by the list and may
+ * be assigned a static asset or a caller-owned descriptor whose lifetime
+ * exceeds the assignment. */
+typedef void (*compact_list_row_decorator_cb_t)(lv_obj_t * list, lv_obj_t * row,
+                                                lv_obj_t * leading_image, int logical_index,
+                                                int pool_slot, int64_t identity, uint64_t artwork_key,
+                                                const char * artwork_name, void * ctx);
+void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx);
+/* Clears every leading image currently showing `src` (pointer compare only,
+ * no decorator run). For owners about to free a borrowed image descriptor. */
+/* Returns true when at least one row image was using src. */
+bool compact_list_detach_image_src(lv_obj_t * list, const void * src);
+/* True when a row currently in the list's recycled pool shows this artwork key. */
+bool compact_list_shows_artwork_key(lv_obj_t * list, uint64_t key);
+/* Makes each visible trailing_asset a separate tappable accessory. The
+ * callback receives the row's current logical index, including after the
+ * virtual row has been recycled during scrolling. NULL disables it. */
+void compact_list_set_trailing_click(lv_obj_t * list, compact_list_click_cb_t cb);
+void compact_list_refresh_visible(lv_obj_t * list);
+void compact_list_refresh_all(void);
+
+/* Recomputes the shared list padding, any icon-caption coordinates, and
+ * every bounded scrolling row label's box height (see row_label_apply_
+ * bounded_height()'s own comment) under root after the stable app_font_*
+ * descriptors change metrics. A NULL root updates only the shared styles
+ * (native_row_min_style, list_row_style). It does not walk beyond the
+ * root passed in -- use screen_builders_refresh_all_font_geometry() when
+ * every live screen must move, not just the nav stack. */
+void screen_builders_refresh_font_geometry(lv_obj_t * root);
+/* Font Size / Custom Font live apply: shared styles, then every screen the
+ * display still owns. Settings submenus that were never on the nav stack
+ * (Music Settings, Power, Playback, ...) keep USER_3 label boxes from the
+ * previous tier unless this runs; LV_LABEL_LONG_SCROLL_CIRCULAR then rolls
+ * those titles vertically when the submenu is first opened. */
+void screen_builders_refresh_all_font_geometry(void);
+/* Re-runs label/accessory decoration for one currently visible logical row.
+ * A row that has already scrolled out is intentionally ignored. */
+void compact_list_refresh_item(lv_obj_t * list, int logical_index);
+
+/* Changes only this compact list's row height. Useful for denser/roomier
+ * feature areas without changing Settings and every other shared row. */
+void compact_list_set_row_height(lv_obj_t * list, int32_t row_height);
+
+/* Switches list to (or refreshes) paged mode: total_count is the logical
+ * row count (drives the scrollbar range and every fetch_page() bound
+ * above) -- call again (passing the same fetch_page/ctx) after the
+ * underlying data changes (e.g. a library rescan, or a live search's
+ * filter changing) to refresh the count and invalidate the row cache.
+ * Pass fetch_page == NULL to switch back to eager mode -- the list then
+ * shows whatever compact_list_set_items() last gave it (empty if that was
+ * never called); total_count/ctx are ignored in that case. */
+void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb_t fetch_page, void * ctx,
+                                      int total_count);
+
+lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
+/* Shared modal surface and full-width actions; callbacks remain owned by callers. */
+lv_obj_t * build_popup_surface(lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
+
+lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
+                               lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
+                               lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
+                               const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                               lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
+
+/* Bottom-sheet Power Hub. action_cb is attached to each full card/Cancel
+ * surface; userdata indices are poweroff, restart, screenoff, sleep timer,
+ * and cancel (0..4). out_actions receives those five tappable surfaces. */
+lv_obj_t * build_power_hub_panel(lv_obj_t * parent, lv_event_cb_t action_cb,
+                                 lv_obj_t ** out_status, lv_obj_t ** out_actions);
+lv_obj_t * build_confirm_popup_with_labels(const char * title_text, lv_label_long_mode_t title_long_mode,
+                                           lv_obj_t ** out_title, const char * body_text, lv_obj_t ** out_body,
+                                           const char * confirm_text, lv_obj_t ** out_confirm_label,
+                                           lv_color_t confirm_color, lv_event_cb_t confirm_cb,
+                                           lv_obj_t ** out_confirm_row, const char * cancel_text,
+                                           lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                                           lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb,
+                                           lv_obj_t ** out_backdrop);
+
+typedef struct {
+    lv_obj_t * popup;
+    lv_obj_t * backdrop;
+    bool visible;
+} gui_popup_t;
+
+void gui_popup_show(gui_popup_t * p);
+void gui_popup_hide(gui_popup_t * p);
+void gui_popup_teardown(gui_popup_t * p);
+bool gui_popup_is_visible(const gui_popup_t * p);
+unsigned gui_popup_visible_count(void);
+
+lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text);
+lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
+lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_event_cb_t on_click);
+lv_obj_t * add_pill_option_row(lv_obj_t * parent, const char * label_text, bool selected,
+                              lv_event_cb_t on_click, void * user_data);
+lv_obj_t * add_section_header(lv_obj_t * parent, const char * text);
+
+int find_nearest_step_index(const int * steps, int count, int value);
+
+/* Builds the shared "rounded card + slider + centered value label" widget
+ * tree used by several settings screens (screen timeout, screen dimming,
+ * startup volume, sleep timer, idle shutdown), including the gesture-bubble
+ * removal and swipe dead zone registration every one of them repeats.
+ * track_top_offset lets a caller that adds its own caption label above the
+ * slider (idle shutdown) push the slider down within the card. Does NOT set
+ * the value label's initial text (callers use different formats) or the
+ * card's hidden flag (callers use different enabled conditions) -- set both
+ * via the returned card / *out_value_label after the call. */
+lv_obj_t * build_setting_slider_card(lv_obj_t * parent, lv_obj_t * align_target, int32_t card_height,
+                                      int32_t track_top_offset, int32_t min_range, int32_t max_range,
+                                      int32_t initial_val, lv_event_cb_t slider_cb,
+                                      lv_obj_t ** out_slider, lv_obj_t ** out_value_label);
+
+/* One line, cut at a character with "…" to the label's set width
+ * (BOARD.ui.no_marquee rows, modern drawer tiles). */
+void label_set_text_single_line(lv_obj_t * label, const char * text);
+
+#endif /* SCREEN_BUILDERS_H */

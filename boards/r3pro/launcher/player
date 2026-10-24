@@ -1,0 +1,10 @@
+#!/bin/sh
+# Mellowtone init shim, R3 Pro bundle install: /data/mellowtone/ui_data/player
+# (/ui_data -> /data/mellowtone/ui_data), which S92_03_start_music_player runs
+# instead of /usr/bin/hiby_player.sh (INSTALL.md). Same rule as the image
+# shim: the launcher; missing or crashed, the stock player; then ADB.
+for l in /data/mellowtone/current/mellowtone-launcher /data/mellowtone/mellowtone-launcher; do
+    [ -x "$l" ] && { "$l"; rc=$?; [ $rc -eq 0 ] && exit 0; echo "$(cut -d' ' -f1 /proc/uptime) shim: $l exit $rc" >> /tmp/mellowtone-shim.log; }
+done
+/usr/bin/hiby_player.sh
+/etc/init.d/K90adb start

@@ -1,0 +1,167 @@
+diff --git a/src/core/lv_obj_pos.c b/src/core/lv_obj_pos.c
+--- a/src/core/lv_obj_pos.c
++++ b/src/core/lv_obj_pos.c
+@@ -367,6 +367,10 @@ bool lv_obj_is_layout_positioned(const lv_obj_t * obj)
+ 
+ void lv_obj_mark_layout_as_dirty(lv_obj_t * obj)
+ {
++    /* Root screens and display layers have no parent. Flag changes can
++     * request layout invalidation for that absent parent. */
++    if(obj == NULL) return;
++
+     obj->layout_inv = 1;
+ 
+     /*Mark the screen as dirty too to mark that there is something to do on this screen*/
+diff --git a/src/libs/lodepng/lodepng.c b/src/libs/lodepng/lodepng.c
+index 7e37636..9c617b2 100644
+--- a/src/libs/lodepng/lodepng.c
++++ b/src/libs/lodepng/lodepng.c
+@@ -5795,7 +5795,22 @@ static void decodeGeneric(unsigned char ** out, unsigned * w, unsigned * h,
+     lodepng_free(idat);
+ 
+     if(!state->error) {
+-        lv_draw_buf_t * decoded = lv_draw_buf_create_ex(image_cache_draw_buf_handlers, *w, *h, LV_COLOR_FORMAT_ARGB8888, 4 * *w);
++        /* postProcessScanlines() below unfilters straight into this buffer at
++        the PNG's own native bpp (lodepng_get_bpp(&state->info_png.color)),
++        not at the fixed 4 bytes/pixel this ARGB8888 draw_buf's default
++        stride assumes -- any source with more than 32 bits per pixel (e.g.
++        16-bit-per-channel RGBA, 64bpp) overflows a 4**w stride by exactly
++        that much, corrupting whatever the allocator placed next on the
++        heap. Widening the stride to the larger of the two needs keeps this
++        buffer correct for both the native unfilter step here and, when no
++        color conversion turns out to be needed (lodepng_decode()'s "same
++        color type" branch), for the final ARGB8888 image this same
++        allocation becomes. */
++        size_t native_bpp = lodepng_get_bpp(&state->info_png.color);
++        size_t native_row_bytes = ((size_t)*w * native_bpp + 7u) / 8u;
++        size_t argb8888_row_bytes = 4 * (size_t)*w;
++        uint32_t stride = (uint32_t)(native_row_bytes > argb8888_row_bytes ? native_row_bytes : argb8888_row_bytes);
++        lv_draw_buf_t * decoded = lv_draw_buf_create_ex(image_cache_draw_buf_handlers, *w, *h, LV_COLOR_FORMAT_ARGB8888, stride);
+         if(decoded) {
+             *out = (unsigned char*)decoded;
+             outsize = decoded->data_size;
+diff --git a/src/libs/tiny_ttf/lv_tiny_ttf.c b/src/libs/tiny_ttf/lv_tiny_ttf.c
+index 09f1e87..f7fd498 100644
+--- a/src/libs/tiny_ttf/lv_tiny_ttf.c
++++ b/src/libs/tiny_ttf/lv_tiny_ttf.c
+@@ -459,6 +459,9 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+         dsc->stream.size = data_size;
+     }
+     if(0 == stbtt_InitFont(&dsc->info, &dsc->stream, stbtt_GetFontOffsetForIndex(&dsc->stream, 0))) {
++        if(path != NULL) {
++            lv_fs_close(&dsc->file);
++        }
+         lv_free(dsc);
+         LV_LOG_ERROR("tiny_ttf: init failed");
+         return NULL;
+@@ -477,6 +480,11 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+ 
+     lv_font_t * out_font = lv_malloc_zeroed(sizeof(lv_font_t));
+     if(out_font == NULL) {
++#if LV_TINY_TTF_FILE_SUPPORT != 0
++        if(path != NULL) {
++            lv_fs_close(&dsc->file);
++        }
++#endif
+         lv_free(dsc);
+         LV_LOG_ERROR("tiny_ttf: out of memory");
+         return NULL;
+diff --git a/src/libs/tjpgd/tjpgd.c b/src/libs/tjpgd/tjpgd.c
+index 7152adf..51c7915 100644
+--- a/src/libs/tjpgd/tjpgd.c
++++ b/src/libs/tjpgd/tjpgd.c
+@@ -888,6 +888,60 @@ JRESULT jd_mcu_output(
+                 }
+             }
+         }
++        /* Descale the MCU rectangular if needed */
++        if(JD_USE_SCALE && jd->scale) {
++            unsigned int x, y, r, g, b, s, w, a;
++            uint8_t * op;
++
++            /* Get averaged RGB value of each square corresponding to a pixel */
++            s = jd->scale * 2;  /* Number of shifts for averaging */
++            w = 1 << jd->scale; /* Width of square */
++            a = (mx - w) * (JD_FORMAT != 2 ? 3 : 1); /* Bytes to skip for next line in the square */
++            op = (uint8_t *)jd->workbuf;
++            for(iy = 0; iy < my; iy += w) {
++                for(ix = 0; ix < mx; ix += w) {
++                    pix = (uint8_t *)jd->workbuf + (iy * mx + ix) * (JD_FORMAT != 2 ? 3 : 1);
++                    r = g = b = 0;
++                    for(y = 0; y < w; y++) {
++                        for(x = 0; x < w; x++) {
++                            r += *pix++;
++                            if(JD_FORMAT != 2) {
++                                g += *pix++;
++                                b += *pix++;
++                            }
++                        }
++                        pix += a;
++                    }
++                    *op++ = (uint8_t)(r >> s);
++                    if(JD_FORMAT != 2) {
++                        *op++ = (uint8_t)(g >> s);
++                        *op++ = (uint8_t)(b >> s);
++                    }
++                }
++            }
++        }
++    }
++    else {    /* 1/8 scaling: one pixel per 8x8 from the block DC. B,G,R to match the full-MCU loop above. */
++        pix = (uint8_t *)jd->workbuf;
++        pc = jd->mcubuf + mx * my;
++        cb = pc[0] - 128;
++        cr = pc[64] - 128;
++        for(iy = 0; iy < my; iy += 8) {
++            py = jd->mcubuf;
++            if(iy == 8) py += 64 * 2;
++            for(ix = 0; ix < mx; ix += 8) {
++                yy = *py;
++                py += 64;
++                if(JD_FORMAT != 2) {
++                    *pix++ = /*B*/ BYTECLIP(yy + ((int)(1.772 * CVACC) * cb) / CVACC);
++                    *pix++ = /*G*/ BYTECLIP(yy - ((int)(0.344 * CVACC) * cb + (int)(0.714 * CVACC) * cr) / CVACC);
++                    *pix++ = /*R*/ BYTECLIP(yy + ((int)(1.402 * CVACC) * cr) / CVACC);
++                }
++                else {
++                    *pix++ = yy;
++                }
++            }
++        }
+     }
+ 
+     /* Squeeze up pixel table if a part of MCU is to be truncated */
+diff --git a/src/libs/tjpgd/tjpgdcnf.h b/src/libs/tjpgd/tjpgdcnf.h
+index dc27d6a..1b543b0 100644
+--- a/src/libs/tjpgd/tjpgdcnf.h
++++ b/src/libs/tjpgd/tjpgdcnf.h
+@@ -2,7 +2,7 @@
+ /* TJpgDec System Configurations R0.03          */
+ /*----------------------------------------------*/
+ 
+-#define JD_SZBUF        512
++#define JD_SZBUF        1024
+ /* Specifies size of stream input buffer */
+ 
+ #define JD_FORMAT       0
+@@ -12,7 +12,7 @@
+ /  2: Grayscale (8-bit/pix)
+ */
+ 
+-#define JD_USE_SCALE    0
++#define JD_USE_SCALE    1
+ /* Switches output descaling feature.
+ /  0: Disable
+ /  1: Enable
+diff --git a/src/misc/cache/class/lv_cache_lru_rb.c b/src/misc/cache/class/lv_cache_lru_rb.c
+index 79b64b1..3774def 100644
+--- a/src/misc/cache/class/lv_cache_lru_rb.c
++++ b/src/misc/cache/class/lv_cache_lru_rb.c
+@@ -410,6 +410,7 @@ static void drop_all_cb(lv_cache_t * cache, void * user_data)
+ 
+     lv_rb_destroy(&lru->rb);
+     lv_ll_clear(&lru->ll);
++    lv_rb_init(&lru->rb, lru->cache.ops.compare_cb, lv_cache_entry_get_size(lru->cache.node_size) + sizeof(void *));
+ 
+     cache->size = 0;
+ }

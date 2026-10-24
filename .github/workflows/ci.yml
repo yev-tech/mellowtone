@@ -1,0 +1,46 @@
+# Tests and builds every board on each push to main and each pull request.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MT_ENGINE: docker
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mellowtone
+          key: mt-deps-${{ hashFiles('cmake/dependencies.cmake') }}
+          restore-keys: mt-deps-
+
+      - name: Build container
+        run: ./mt setup build
+
+      - name: Tests
+        run: ./mt test
+
+      - name: Build every board
+        run: |
+          for board in r3pro r1 r3proii r3ii_2025; do
+            echo "::group::$board"
+            ./mt build "$board"
+            echo "::endgroup::"
+          done

@@ -1,0 +1,20 @@
+themes/topbar icons
+
+Wi-Fi signal bars for the network list (src/ui/gui_wifi.c builds
+topbar/wifi_connect_<level>.png), 28x30 RGBA, white on transparency.
+
+Glyphs: Phosphor Icons (Fill variant)
+License: MIT License
+https://github.com/phosphor-icons/core
+https://cdn.jsdelivr.net/npm/@phosphor-icons/core@2.1.1/assets/fill/<name>.svg
+
+Mapping:
+  wifi_connect_0.png <- phosphor/wifi-none-fill #FFFFFF (28x30)
+  wifi_connect_1.png <- phosphor/wifi-low-fill #FFFFFF (28x30)
+  wifi_connect_2.png <- phosphor/wifi-medium-fill #FFFFFF (28x30)
+  wifi_connect_3.png <- phosphor/wifi-high-fill #FFFFFF (28x30)
+
+The status bar's m_*.png icons (battery, Bluetooth, volume, Wi-Fi levels,
+codec labels) are drawn by boards/r3pro/tools/gen_drawer_icons.py (original
+geometry; the codec labels use Noto Sans Medium, SIL Open Font License 1.1).
+The lucide_*.png icons are listed in LUCIDE_SOURCES.txt.

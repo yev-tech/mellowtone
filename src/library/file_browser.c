@@ -1,0 +1,1249 @@
+#include "board.h"
+#include "board_config.h"
+#include <stdatomic.h>
+#include "file_browser.h"
+#include "i18n.h"
+#include "assets.h"
+#include "screen_builders.h" /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT / LIST_ROW_* */
+#include "playlist_files.h" /* playlist_files_resolve_path() -- shared M3U line resolution */
+#include "library_endian.h"
+#include "fallback_font.h"
+#include "mt_features.h"
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdio.h>
+#include <errno.h>
+
+/* dir + "/" + name into out; false when it does not fit, since a cut-off
+ * path names a different file. */
+static bool join_path(char * out, size_t size, const char * dir, const char * name) {
+    return (size_t) snprintf(out, size, "%s/%s", dir, name) < size;
+}
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+
+typedef struct {
+    char name[256];
+    bool is_dir;
+    bool is_playlist;
+    bool is_cue;
+    int64_t mtime;
+    bool mtime_known;
+    int32_t playable_ordinal;
+} dir_entry_t;
+
+struct file_browser_index {
+    int fd;
+    int playable_fd;
+    int directory_fd;
+    dir_entry_t *memory_rows;
+    dir_entry_t *memory_playable_rows;
+    bool memory_backed;
+    unsigned count;
+    unsigned playable_count;
+    char directory[PATH_MAX];
+};
+
+#ifndef INDEX_RUN_SIZE
+#define INDEX_RUN_SIZE 256
+#endif
+#define INDEX_MEMORY_MAX_ROWS 4096
+
+
+static char root_dir[PATH_MAX];
+static char current_dir[PATH_MAX];
+#define FILE_BROWSER_PAGE_SIZE 64
+static dir_entry_t visible_entries[FILE_BROWSER_PAGE_SIZE];
+static dir_entry_t * entries = visible_entries;
+static int entry_count = 0;
+/* `entries` is only the visible page. The full directory stays in current_index. */
+static int page_start = 0;
+static file_browser_index_t * current_index;
+static pthread_mutex_t index_worker_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t index_worker_thread;
+static atomic_bool index_worker_running;
+static atomic_bool index_worker_cancel;
+static atomic_bool index_worker_error;
+static atomic_bool index_worker_oversized;
+static unsigned index_request_generation;
+static file_browser_index_t * index_worker_result;
+static unsigned index_worker_result_generation;
+static atomic_int current_sort_mode;
+static unsigned index_error_generation;
+static unsigned index_error_rendered_generation;
+/* The card is being lent (file_browser_release_card()): no listing opens a
+ * directory until file_browser_reset_to_root(). Under index_worker_mu. */
+static bool card_released;
+static lv_timer_t * index_poll_timer;
+static void browser_delete_cb(lv_event_t *event);
+
+static lv_obj_t * path_label;
+static lv_obj_t * list;
+static file_browser_select_cb_t select_cb;
+static file_browser_cue_select_cb_t cue_select_cb;
+static file_browser_index_select_cb_t index_select_cb;
+static bool is_cue_file(const char * name);
+static bool index_entry_at(const file_browser_index_t *index, unsigned ordinal, dir_entry_t *out);
+static bool index_row_playable(const dir_entry_t *row);
+
+/* Snapshot of the directory + raw on-screen row (entries[] index, not the
+ * file-only position select_cb receives) a file/playlist was last tapped
+ * from -- set in entry_click_cb() right before invoking select_cb(), for
+ * gui.c's player "List" option to later reopen the browser at that same
+ * spot. */
+static char last_selected_dir[PATH_MAX];
+static int last_selected_row = -1;
+
+static void rebuild_list(void);
+static void scan_current_dir(void);
+
+/* Where each ancestor's list was when a folder was opened from it, so going
+ * back up returns to the same page and scroll offset instead of the top.
+ * Deeper than the stack, back simply starts at the top. The listing loads
+ * asynchronously, so the offset is applied once the parent's index arrives
+ * (restore_generation ties it to that exact request). */
+#define FILE_BROWSER_POSITION_STACK 32
+typedef struct {
+    int page_start;
+    int32_t scroll_y;
+} browser_position_t;
+static browser_position_t position_stack[FILE_BROWSER_POSITION_STACK];
+static int position_depth;
+static int position_overflow;
+static bool restore_pending;
+static int32_t restore_scroll_y;
+static unsigned restore_generation;
+
+/* Kept in sync with audio.c's decoder dispatch. A codec left out of the
+ * build (mt_features.h) takes its file type out of the browser and the
+ * library scan. */
+static const struct {
+    const char * ext;
+    bool built;
+} PLAYABLE_EXTENSIONS[] = {
+    { ".flac", true }, { ".mp3", true }, { ".wav", true }, { ".rf64", true }, { ".w64", true },
+    { ".aiff", true }, { ".aif", true }, { ".aifc", true }, { ".dsf", true }, { ".dff", true },
+    { ".aac", true }, { ".m4a", true }, { ".m4b", true }, { ".ape", true },
+    { ".wma", MT_HAS_FEATURE(CODEC_WMA) }, { ".opus", MT_HAS_FEATURE(CODEC_OPUS) },
+    { ".ogg", true }, { ".oga", true },
+};
+
+bool file_browser_is_playable_name(const char * name) {
+    const char * ext = strrchr(name, '.');
+    if (!ext) return false;
+    for (size_t i = 0; i < sizeof(PLAYABLE_EXTENSIONS) / sizeof(PLAYABLE_EXTENSIONS[0]); i++) {
+        if (PLAYABLE_EXTENSIONS[i].built && strcasecmp(ext, PLAYABLE_EXTENSIONS[i].ext) == 0) return true;
+    }
+    return false;
+}
+
+
+static bool is_cue_file(const char * name) {
+    const char * ext = strrchr(name, '.');
+    if (!ext) return false;
+    return strcasecmp(ext, ".cue") == 0;
+}
+
+static int compare_entries_mode(const void * a, const void * b, file_browser_sort_mode_t mode) {
+    const dir_entry_t * ea = (const dir_entry_t *) a;
+    const dir_entry_t * eb = (const dir_entry_t *) b;
+    if (ea->is_dir != eb->is_dir) return ea->is_dir ? -1 : 1; /* directories before files */
+    if (mode == FILE_BROWSER_SORT_NEWEST) {
+        if (ea->mtime_known != eb->mtime_known) return ea->mtime_known ? -1 : 1;
+        if (ea->mtime_known && ea->mtime != eb->mtime) return ea->mtime > eb->mtime ? -1 : 1;
+    }
+    int by_name = strcasecmp(ea->name, eb->name);
+    return by_name ? by_name : strcmp(ea->name, eb->name);
+}
+
+static file_browser_sort_mode_t sort_mode_snapshot(void) {
+    int mode = atomic_load_explicit(&current_sort_mode, memory_order_acquire);
+    return mode == FILE_BROWSER_SORT_NEWEST ? FILE_BROWSER_SORT_NEWEST : FILE_BROWSER_SORT_NAME;
+}
+
+static int compare_entries_name(const void *a, const void *b) {
+    return compare_entries_mode(a, b, FILE_BROWSER_SORT_NAME);
+}
+static int compare_entries_newest(const void *a, const void *b) {
+    return compare_entries_mode(a, b, FILE_BROWSER_SORT_NEWEST);
+}
+static int (*sort_comparator(file_browser_sort_mode_t mode))(const void *, const void *) {
+    return mode == FILE_BROWSER_SORT_NEWEST ? compare_entries_newest : compare_entries_name;
+}
+
+static int index_make_entry(int directory_fd, const char *name, unsigned char type,
+                            dir_entry_t *out, bool include_cue) {
+    struct stat st;
+    bool mtime_known = fstatat(directory_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!mtime_known && errno == ENOENT) return 0;
+    if (mtime_known && !S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return 0;
+    /* Preserve useful entries when the filesystem supplies a reliable dirent
+     * type but cannot provide metadata. Their unknown timestamp sorts last. */
+    bool dir;
+    if (mtime_known) dir = S_ISDIR(st.st_mode);
+    else if (type == DT_DIR) dir = true;
+    else if (type == DT_REG) dir = false;
+    else return -1;
+    bool playlist = !dir && library_is_m3u_file(name);
+    bool cue = !dir && include_cue && is_cue_file(name);
+    if (!dir && !playlist && !cue && !file_browser_is_playable_name(name)) return 0;
+    memset(out, 0, sizeof(*out));
+    utf8_truncate_safe(out->name, name, sizeof(out->name));
+    out->is_dir = dir; out->is_playlist = playlist; out->is_cue = cue;
+    out->mtime_known = mtime_known;
+    if (mtime_known) out->mtime = (int64_t)st.st_mtime;
+    return 1;
+}
+
+static int index_temp_fd(int directory_fd) {
+    char name[64];
+    if (BOARD.paths.scan_spool_dir) {
+        /* BOARD.paths.scan_spool_dir (R3 Pro): its exFAT fails writes to
+         * unlinked files; spool in RAM instead. */
+        int spool_dir = open(BOARD.paths.scan_spool_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (spool_dir < 0) return -1;
+        for (unsigned attempt = 0; attempt < 100; attempt++) {
+            snprintf(name, sizeof(name), ".mellowtone_files_%ld_%u", (long)getpid(), attempt);
+            int fd = openat(spool_dir, name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if (fd >= 0) {
+                int rc = unlinkat(spool_dir, name, 0);
+                close(spool_dir);
+                if (rc != 0) { close(fd); return -1; }
+                return fd;
+            }
+            if (errno != EEXIST) { close(spool_dir); return -1; }
+        }
+        close(spool_dir);
+        return -1;
+    }
+    for (unsigned attempt = 0; attempt < 100; attempt++) {
+        snprintf(name, sizeof(name), ".mellowtone_files_%ld_%u", (long)getpid(), attempt);
+        int fd = openat(directory_fd, name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { if (unlinkat(directory_fd, name, 0) != 0) { close(fd); return -1; } return fd; }
+        if (errno != EEXIST) return -1;
+    }
+    return -1;
+}
+
+static int index_read_record(int fd, dir_entry_t *row) {
+    size_t got = 0;
+    while (got < sizeof(*row)) {
+        ssize_t n = read(fd, (char *)row + got, sizeof(*row) - got);
+        if (n > 0) { got += (size_t)n; continue; }
+        if (n == 0 && got == 0) return 1;
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+static bool index_write_full(int fd, const void *data, size_t size) {
+    const char *p = data;
+    while (size) {
+        ssize_t n = write(fd, p, size);
+        if (n > 0) { p += n; size -= (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+static int index_write_run(int directory_fd, dir_entry_t *rows, size_t count, file_browser_sort_mode_t mode) {
+    qsort(rows, count, sizeof(*rows), sort_comparator(mode));
+    int fd = index_temp_fd(directory_fd);
+    if (fd < 0 || !index_write_full(fd, rows, count * sizeof(*rows))) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET); return fd;
+}
+
+static int index_merge_runs(int left, int right, int directory_fd, atomic_bool *cancel, file_browser_sort_mode_t mode) {
+    int out = index_temp_fd(directory_fd);
+    if (out < 0) { close(left); close(right); return -1; }
+    dir_entry_t a, b;
+    int na = index_read_record(left, &a), nb = index_read_record(right, &b);
+    if (na < 0 || nb < 0) { close(left); close(right); close(out); return -1; }
+    while (na == 0 || nb == 0) {
+        if (cancel && atomic_load(cancel)) { close(left); close(right); close(out); return -1; }
+        dir_entry_t *pick;
+        if (nb != 0 || (na == 0 && compare_entries_mode(&a, &b, mode) <= 0)) pick = &a;
+        else pick = &b;
+        if (!index_write_full(out, pick, sizeof(*pick))) { close(left); close(right); close(out); return -1; }
+        if (pick == &a) na = index_read_record(left, &a); else nb = index_read_record(right, &b);
+        if (na < 0 || nb < 0) { close(left); close(right); close(out); return -1; }
+    }
+    close(left); close(right); lseek(out, 0, SEEK_SET); return out;
+}
+
+static bool index_cancelled(atomic_bool *cancel) {
+    return cancel && atomic_load_explicit(cancel, memory_order_acquire);
+}
+
+static bool index_open_memory(const char *directory, DIR *dir, int dfd,
+                              file_browser_index_t **out,
+                              unsigned *out_count, bool include_cue,
+                              atomic_bool *cancel, file_browser_sort_mode_t mode) {
+    dir_entry_t *rows = malloc(sizeof(*rows) * INDEX_MEMORY_MAX_ROWS);
+    if (!rows) { close(dfd); closedir(dir); return false; }
+    unsigned count = 0;
+    bool ok = true;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dir);
+        if (!de) { if (errno) ok = false; break; }
+        if (index_cancelled(cancel)) { ok = false; break; }
+        if (de->d_name[0] == '.') continue;
+        dir_entry_t candidate;
+        int status = index_make_entry(dfd, de->d_name, de->d_type, &candidate, include_cue);
+        if (status < 0) { ok = false; break; }
+        if (status > 0) {
+            if (count >= INDEX_MEMORY_MAX_ROWS) { errno = EFBIG; ok = false; break; }
+            rows[count] = candidate;
+            count++;
+        }
+    }
+    int failure_errno = errno;
+    closedir(dir);
+    if (!ok) { free(rows); close(dfd); errno = failure_errno; return false; }
+    qsort(rows, count, sizeof(*rows), sort_comparator(mode));
+    file_browser_index_t *idx = calloc(1, sizeof(*idx));
+    if (!idx) { free(rows); close(dfd); return false; }
+    idx->fd = -1; idx->playable_fd = -1; idx->directory_fd = dfd;
+    idx->memory_rows = rows;
+    idx->memory_playable_rows = count ? malloc(sizeof(*rows) * count) : NULL;
+    idx->memory_backed = true; idx->count = count;
+    if (count && !idx->memory_playable_rows) {
+        free(idx->memory_rows); free(idx); close(dfd); return false;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        idx->memory_rows[i].playable_ordinal = -1;
+        if (index_row_playable(&idx->memory_rows[i])) {
+            idx->memory_rows[i].playable_ordinal = (int32_t)idx->playable_count;
+            idx->memory_playable_rows[idx->playable_count++] = idx->memory_rows[i];
+        }
+    }
+    snprintf(idx->directory, sizeof(idx->directory), "%s", directory);
+    *out = idx; if (out_count) *out_count = count;
+    return true;
+}
+
+static bool file_browser_index_open_ex(const char *directory, file_browser_index_t **out,
+                                       unsigned *out_count, bool include_cue,
+                                       atomic_bool *cancel, file_browser_sort_mode_t mode) {
+    if (!directory || !out) return false;
+    *out = NULL; if (out_count) *out_count = 0;
+    DIR *dir = opendir(directory); if (!dir) return false;
+    int dfd = dup(dirfd(dir)), levels[32];
+    if (dfd < 0) { closedir(dir); return false; }
+#ifdef FILE_BROWSER_TEST_FORCE_MEMORY_INDEX
+    return index_open_memory(directory, dir, dfd, out, out_count, include_cue, cancel, mode);
+#endif
+    memset(levels, -1, sizeof(levels));
+    errno = 0;
+    int probe = index_temp_fd(dfd);
+    if (probe < 0 && (errno == EROFS || errno == EACCES || errno == EPERM)) {
+        return index_open_memory(directory, dir, dfd, out, out_count, include_cue, cancel, mode);
+    }
+    if (probe < 0) goto fail;
+    close(probe);
+    size_t row_count = 0; unsigned total = 0;
+    dir_entry_t rows[INDEX_RUN_SIZE]; struct dirent *de;
+    for (;;) {
+        errno = 0;
+        de = readdir(dir);
+        if (!de) { if (errno) goto fail; break; }
+        if (cancel && atomic_load(cancel)) goto fail;
+        if (de->d_name[0] == '.') continue;
+        int entry_status = index_make_entry(dfd, de->d_name, de->d_type, &rows[row_count], include_cue);
+        if (entry_status < 0) goto fail;
+        if (entry_status == 0) continue;
+        if (++row_count == INDEX_RUN_SIZE) {
+            int fd = index_write_run(dfd, rows, row_count, mode); if (fd < 0) goto fail;
+            total += (unsigned)row_count; row_count = 0;
+            for (unsigned level = 0; ; level++) { if (level >= 32) { close(fd); goto fail; } if (levels[level] < 0) { levels[level] = fd; break; } int prior = levels[level]; levels[level] = -1; fd = index_merge_runs(prior, fd, dfd, cancel, mode); if (fd < 0) goto fail; }
+        }
+    }
+    if (row_count) { int fd = index_write_run(dfd, rows, row_count, mode); if (fd < 0) goto fail; total += (unsigned)row_count; for (unsigned level = 0; ; level++) { if (level >= 32) { close(fd); goto fail; } if (levels[level] < 0) { levels[level] = fd; break; } int prior = levels[level]; levels[level] = -1; fd = index_merge_runs(prior, fd, dfd, cancel, mode); if (fd < 0) goto fail; } }
+    closedir(dir);
+    int final = -1; for (unsigned level = 0; level < 32; level++) if (levels[level] >= 0) { int prior = levels[level]; levels[level] = -1; if (final < 0) final = prior; else { final = index_merge_runs(prior, final, dfd, cancel, mode); if (final < 0) goto fail_closed; } }
+    file_browser_index_t *idx = calloc(1, sizeof(*idx)); if (!idx) { if (final >= 0) close(final); goto fail_closed; }
+    idx->fd = final >= 0 ? final : index_temp_fd(dfd); idx->count = total; idx->playable_fd = index_temp_fd(dfd); idx->directory_fd = dup(dfd); idx->playable_count = 0;
+    if (idx->fd < 0 || idx->playable_fd < 0 || idx->directory_fd < 0) { if (idx->fd >= 0) close(idx->fd); if (idx->playable_fd >= 0) close(idx->playable_fd); if (idx->directory_fd >= 0) close(idx->directory_fd); free(idx); goto fail_closed; }
+    dir_entry_t row;
+    for (unsigned i = 0; i < idx->count; i++) {
+        if (pread(idx->fd, &row, sizeof(row), (off_t)i * sizeof(row)) != (ssize_t)sizeof(row)) { close(idx->fd); close(idx->playable_fd); close(idx->directory_fd); free(idx); goto fail_closed; }
+        row.playable_ordinal = -1;
+        if (index_row_playable(&row)) {
+            row.playable_ordinal = (int32_t)idx->playable_count;
+            if (pwrite(idx->fd, &row, sizeof(row), (off_t)i * sizeof(row)) != (ssize_t)sizeof(row) ||
+                !index_write_full(idx->playable_fd, &row, sizeof(row))) { close(idx->fd); close(idx->playable_fd); close(idx->directory_fd); free(idx); goto fail_closed; }
+            idx->playable_count++;
+        }
+    }
+    lseek(idx->playable_fd, 0, SEEK_SET);
+    snprintf(idx->directory, sizeof(idx->directory), "%s", directory);
+    close(dfd); *out = idx; if (out_count) *out_count = idx->count; return true;
+fail:
+    closedir(dir);
+fail_closed:
+    close(dfd); for (unsigned i = 0; i < 32; i++) if (levels[i] >= 0) close(levels[i]); return false;
+}
+
+bool file_browser_index_open(const char *directory, file_browser_index_t **out, unsigned *out_count) {
+    return file_browser_index_open_ex(directory, out, out_count, false, NULL, sort_mode_snapshot());
+}
+
+bool file_browser_index_retain(const file_browser_index_t *source, file_browser_index_t **out) {
+    if (!source || !out) return false;
+    file_browser_index_t *copy = calloc(1, sizeof(*copy));
+    if (!copy) return false;
+    if (source->memory_backed) {
+        copy->fd = -1; copy->playable_fd = -1;
+        copy->directory_fd = dup(source->directory_fd);
+        copy->count = source->count; copy->playable_count = source->playable_count;
+        copy->memory_backed = true;
+        copy->memory_rows = malloc(sizeof(*copy->memory_rows) * copy->count);
+        copy->memory_playable_rows = malloc(sizeof(*copy->memory_playable_rows) * copy->playable_count);
+        if (copy->directory_fd < 0 || (copy->count && !copy->memory_rows) ||
+            (copy->playable_count && !copy->memory_playable_rows)) {
+            if (copy->directory_fd >= 0) close(copy->directory_fd);
+            free(copy->memory_rows); free(copy->memory_playable_rows); free(copy); return false;
+        }
+        memcpy(copy->memory_rows, source->memory_rows, sizeof(*copy->memory_rows) * copy->count);
+        memcpy(copy->memory_playable_rows, source->memory_playable_rows,
+               sizeof(*copy->memory_playable_rows) * copy->playable_count);
+        snprintf(copy->directory, sizeof(copy->directory), "%s", source->directory);
+        *out = copy; return true;
+    }
+    copy->fd = dup(source->fd); copy->playable_fd = dup(source->playable_fd); copy->directory_fd = dup(source->directory_fd);
+    if (copy->fd < 0 || copy->playable_fd < 0 || copy->directory_fd < 0) { if (copy->fd >= 0) close(copy->fd); if (copy->playable_fd >= 0) close(copy->playable_fd); if (copy->directory_fd >= 0) close(copy->directory_fd); free(copy); return false; }
+    copy->count = source->count; copy->playable_count = source->playable_count; snprintf(copy->directory, sizeof(copy->directory), "%s", source->directory); *out = copy; return true;
+}
+
+bool file_browser_index_path_at(const file_browser_index_t *index, unsigned ordinal, char *out_path, size_t out_size) {
+    if (!index || ordinal >= index->count || !out_path || !out_size) return false;
+    dir_entry_t row;
+    if (index->memory_backed) row = index->memory_rows[ordinal];
+    else if (pread(index->fd, &row, sizeof(row), (off_t)ordinal * sizeof(row)) != (ssize_t)sizeof(row)) return false;
+    return snprintf(out_path, out_size, "%s/%s", index->directory, row.name) < (int)out_size;
+}
+
+static bool index_row_playable(const dir_entry_t *row) {
+    return row && !row->is_dir && !row->is_playlist && !row->is_cue;
+}
+
+unsigned file_browser_index_playable_count(const file_browser_index_t *index) {
+    if (!index) return 0;
+    return index->playable_count;
+}
+
+bool file_browser_index_playable_path_at(const file_browser_index_t *index, unsigned ordinal,
+                                         char *out_path, size_t out_size) {
+    if (!index || !out_path || !out_size) return false;
+    if (ordinal >= index->playable_count) return false;
+    dir_entry_t row;
+    if (index->memory_backed) row = index->memory_playable_rows[ordinal];
+    else if (pread(index->playable_fd, &row, sizeof(row), (off_t)ordinal * sizeof(row)) != (ssize_t)sizeof(row)) return false;
+    return snprintf(out_path, out_size, "%s/%s", index->directory, row.name) < (int)out_size;
+}
+
+int file_browser_index_dup_directory_fd(const file_browser_index_t *index) {
+    return index ? dup(index->directory_fd) : -1;
+}
+
+const char *file_browser_index_directory(const file_browser_index_t *index) {
+    return index ? index->directory : NULL;
+}
+
+void file_browser_index_close(file_browser_index_t *index) {
+    if (!index) return;
+    if (index->fd >= 0) close(index->fd);
+    if (index->playable_fd >= 0) close(index->playable_fd);
+    if (index->directory_fd >= 0) close(index->directory_fd);
+    free(index->memory_rows); free(index->memory_playable_rows); free(index);
+}
+
+static bool index_entry_at(const file_browser_index_t *index, unsigned ordinal, dir_entry_t *out) {
+    if (!index || ordinal >= index->count || !out) return false;
+    if (index->memory_backed) { *out = index->memory_rows[ordinal]; return true; }
+    return pread(index->fd, out, sizeof(*out), (off_t)ordinal * sizeof(*out)) == (ssize_t)sizeof(*out);
+}
+
+bool file_browser_index_entry_name(const file_browser_index_t *index, unsigned ordinal,
+                                   char *name, size_t name_size, bool *is_dir) {
+    dir_entry_t row;
+    if (!name || name_size == 0 || !index_entry_at(index, ordinal, &row)) return false;
+    if (strlen(row.name) >= name_size) return false;
+    memcpy(name, row.name, strlen(row.name) + 1);
+    if (is_dir) *is_dir = row.is_dir;
+    return true;
+}
+
+/* Copy one screen of an already-open index. Does not rescan or allocate. */
+static bool load_visible_entries(void) {
+    if (entry_count < 0) return false;
+    if (page_start < 0) page_start = 0;
+    if (page_start >= entry_count)
+        page_start = entry_count > 0 ? ((entry_count - 1) / FILE_BROWSER_PAGE_SIZE) * FILE_BROWSER_PAGE_SIZE : 0;
+    if (!current_index) return entry_count == 0;
+    int end = page_start + FILE_BROWSER_PAGE_SIZE;
+    if (end > entry_count) end = entry_count;
+    for (int i = page_start; i < end; i++) {
+        if (!index_entry_at(current_index, (unsigned) i, &visible_entries[i - page_start])) return false;
+    }
+    return true;
+}
+
+static void free_entries(void) {
+    if (current_index) { file_browser_index_close(current_index); current_index = NULL; }
+    memset(visible_entries, 0, sizeof(visible_entries));
+    entries = visible_entries;
+    entry_count = 0;
+}
+
+/* Scans dir_path into a freshly malloc'd, sorted (dirs-first, then alpha)
+ * array of playable entries. Caller owns the result (free() it). Used both
+ * for the interactive browser's current directory (via scan_current_dir)
+ * and for one-shot lookups that don't touch the browser's own state (e.g.
+ * resuming a track without ever having opened the browser screen). */
+static int scan_entry_limit(void) {
+    const char *limit = getenv("FILE_BROWSER_TEST_ENTRY_LIMIT");
+    if (!limit || !limit[0]) return INT_MAX;
+    char *end = NULL;
+    long value = strtol(limit, &end, 10);
+    if (end == limit || value < 0 || value > INT_MAX) return INT_MAX;
+    return (int) value;
+}
+
+/* Returns the entry count, 0 when the directory cannot be opened, and -1
+ * when memory cannot hold the whole directory. A short list is never
+ * reported as success. */
+static int scan_directory(const char * dir_path, dir_entry_t ** out_entries,
+                          file_browser_sort_mode_t mode, bool include_cue) {
+    DIR * dir = opendir(dir_path);
+    if (!dir) {
+        fprintf(stderr, "file_browser: failed to open '%s'\n", dir_path);
+        *out_entries = NULL;
+        return 0;
+    }
+
+    int capacity = 32;
+    int count = 0;
+    int limit = scan_entry_limit();
+    dir_entry_t * result = malloc(sizeof(dir_entry_t) * (size_t) capacity);
+    if (!result) {
+        closedir(dir);
+        *out_entries = NULL;
+        return -1;
+    }
+
+    struct dirent * de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') continue; /* skips ".", "..", and hidden files/dirs */
+
+        dir_entry_t candidate;
+        int status = index_make_entry(dirfd(dir), de->d_name, de->d_type,
+                                      &candidate, include_cue);
+        if (status < 0) {
+            free(result);
+            closedir(dir);
+            *out_entries = NULL;
+            return -1;
+        }
+        if (status == 0) continue;
+
+        if (count >= limit) {
+            free(result);
+            closedir(dir);
+            *out_entries = NULL;
+            return -1;
+        }
+        if (count == capacity) {
+            dir_entry_t * grown = realloc(result, sizeof(dir_entry_t) * (size_t) (capacity * 2));
+            if (!grown) {
+                free(result);
+                closedir(dir);
+                *out_entries = NULL;
+                return -1;
+            }
+            result = grown;
+            capacity *= 2;
+        }
+
+        result[count] = candidate;
+        count++;
+    }
+
+    closedir(dir);
+
+    qsort(result, (size_t) count, sizeof(dir_entry_t), sort_comparator(mode));
+    *out_entries = result;
+    return count;
+}
+
+typedef struct {
+    unsigned generation;
+    char directory[PATH_MAX];
+    bool include_cue;
+    file_browser_sort_mode_t sort_mode;
+} index_worker_request_t;
+
+static void *index_worker_main(void *arg) {
+    index_worker_request_t request = *(index_worker_request_t *)arg;
+    free(arg);
+    unsigned generation = request.generation;
+    file_browser_index_t *built = NULL; unsigned count = 0;
+    bool ok = file_browser_index_open_ex(request.directory, &built, &count, request.include_cue, &index_worker_cancel, request.sort_mode);
+    pthread_mutex_lock(&index_worker_mu);
+    if (ok && !atomic_load(&index_worker_cancel) && generation == index_request_generation) {
+        if (index_worker_result) file_browser_index_close(index_worker_result);
+        index_worker_result = built; index_worker_result_generation = generation;
+    } else {
+        if (built) file_browser_index_close(built);
+        if (!ok && generation == index_request_generation) {
+            atomic_store(&index_worker_error, true);
+            atomic_store(&index_worker_oversized, errno == EFBIG);
+            index_error_generation = generation;
+        }
+    }
+    atomic_store(&index_worker_running, false);
+    pthread_mutex_unlock(&index_worker_mu);
+    return NULL;
+}
+
+/* Called with index_worker_mu held; all mutable inputs are copied into this
+ * request before the worker starts, so a newer scan cannot change its order. */
+static bool index_worker_launch_locked(unsigned generation) {
+    if (card_released) return true; /* an empty listing until the card is back */
+    index_worker_request_t *request = calloc(1, sizeof(*request));
+    if (!request) return false;
+    request->generation = generation;
+    snprintf(request->directory, sizeof(request->directory), "%s", current_dir);
+    request->include_cue = cue_select_cb != NULL;
+    request->sort_mode = sort_mode_snapshot();
+    atomic_store(&index_worker_cancel, false);
+    atomic_store(&index_worker_running, true);
+    if (pthread_create(&index_worker_thread, NULL, index_worker_main, request) != 0) {
+        free(request);
+        atomic_store(&index_worker_running, false);
+        return false;
+    }
+    pthread_detach(index_worker_thread);
+    return true;
+}
+
+static void index_poll_cb(lv_timer_t *timer) {
+    (void)timer;
+    pthread_mutex_lock(&index_worker_mu);
+    file_browser_index_t *ready = index_worker_result;
+    unsigned generation = index_worker_result_generation;
+    index_worker_result = NULL;
+    bool running = atomic_load(&index_worker_running);
+    pthread_mutex_unlock(&index_worker_mu);
+    if (!ready || generation != index_request_generation) {
+        if (ready) file_browser_index_close(ready);
+        if (!running && atomic_load(&index_worker_error) &&
+            index_error_generation == index_request_generation &&
+            index_error_rendered_generation != index_request_generation) {
+            index_error_rendered_generation = index_request_generation;
+            free_entries();
+            entry_count = -1;
+            rebuild_list();
+        }
+        else if (!running && !atomic_load(&index_worker_error) && !current_index && entry_count == 0) {
+            pthread_mutex_lock(&index_worker_mu);
+            if (!index_worker_launch_locked(index_request_generation)) {
+                atomic_store(&index_worker_error, true);
+                index_error_generation = index_request_generation;
+            }
+            pthread_mutex_unlock(&index_worker_mu);
+        }
+        return;
+    }
+    if (current_index) file_browser_index_close(current_index);
+    current_index = ready; entry_count = (int)ready->count;
+    if (!load_visible_entries()) {
+        atomic_store(&index_worker_error, true);
+        entry_count = -1;
+    }
+    rebuild_list();
+    if (restore_pending && restore_generation == generation) {
+        restore_pending = false;
+        if (entry_count > 0) {
+            /* Clamped by LVGL if the folder shrank since. */
+            lv_obj_update_layout(list);
+            lv_obj_scroll_to_y(list, restore_scroll_y, LV_ANIM_OFF);
+        }
+    }
+    (void)running;
+}
+
+static void scan_current_dir(void) {
+    free_entries();
+    pthread_mutex_lock(&index_worker_mu);
+    unsigned generation = ++index_request_generation;
+    atomic_store(&index_worker_error, false);
+    atomic_store(&index_worker_oversized, false);
+    atomic_store(&index_worker_cancel, true);
+    if (index_worker_result) { file_browser_index_close(index_worker_result); index_worker_result = NULL; }
+    if (!atomic_load(&index_worker_running) && !index_worker_launch_locked(generation)) {
+        atomic_store(&index_worker_error, true);
+        index_error_generation = generation;
+    }
+    pthread_mutex_unlock(&index_worker_mu);
+    entry_count = 0;
+}
+
+static void browser_delete_cb(lv_event_t *event) {
+    (void)event;
+    pthread_mutex_lock(&index_worker_mu);
+    ++index_request_generation;
+    atomic_store(&index_worker_cancel, true);
+    if (index_worker_result) { file_browser_index_close(index_worker_result); index_worker_result = NULL; }
+    if (current_index) { file_browser_index_close(current_index); current_index = NULL; }
+    if (index_poll_timer) { lv_timer_del(index_poll_timer); index_poll_timer = NULL; }
+    list = NULL; path_label = NULL;
+    pthread_mutex_unlock(&index_worker_mu);
+}
+
+/* Builds the playlist from every playable file in the current directory
+ * (in the same sorted order they're displayed) and reports which position
+ * within that file-only list corresponds to `file_display_index`. */
+static void build_playlist_and_select(int file_display_index) {
+    dir_entry_t selected_entry;
+    if (!index_entry_at(current_index, (unsigned)file_display_index, &selected_entry)) return;
+    if (index_select_cb) {
+        unsigned playable = current_index->playable_count;
+        unsigned selected = selected_entry.playable_ordinal >= 0 ? (unsigned)selected_entry.playable_ordinal : 0;
+        file_browser_index_t *retained = NULL;
+        if (file_browser_index_retain(current_index, &retained)) index_select_cb(retained, playable, selected);
+        return;
+    }
+    dir_entry_t *all = NULL;
+    int all_count = scan_directory(current_dir, &all, sort_mode_snapshot(), cue_select_cb != NULL);
+    if (all_count <= 0) { free(all); return; }
+    char ** playlist = malloc(sizeof(char *) * (size_t) all_count);
+    if (!playlist) { free(all); return; }
+    int count = 0;
+    int selected = -1;
+
+    for (int i = 0; i < all_count; i++) {
+        if (all[i].is_dir || all[i].is_playlist || all[i].is_cue) continue;
+        char full_path[PATH_MAX];
+        if (!join_path(full_path, sizeof(full_path), current_dir, all[i].name)) continue;
+        if (strcmp(all[i].name, selected_entry.name) == 0) selected = count;
+        playlist[count] = strdup(full_path);
+        if (!playlist[count]) { for (int j = 0; j < count; j++) free(playlist[j]); free(playlist); free(all); return; }
+        count++;
+    }
+    free(all);
+
+    if (selected < 0) {
+        for (int i = 0; i < count; i++) free(playlist[i]);
+        free(playlist);
+        return;
+    }
+
+    select_cb(playlist, count, selected);
+}
+
+void file_browser_set_index_select_cb(file_browser_index_select_cb_t callback) {
+    index_select_cb = callback;
+}
+
+file_browser_sort_mode_t file_browser_get_sort_mode(void) {
+    return sort_mode_snapshot();
+}
+
+void file_browser_set_sort_mode(file_browser_sort_mode_t mode) {
+    if (mode != FILE_BROWSER_SORT_NEWEST) mode = FILE_BROWSER_SORT_NAME;
+    file_browser_sort_mode_t previous = sort_mode_snapshot();
+    if (previous == mode) return;
+    atomic_store_explicit(&current_sort_mode, mode, memory_order_release);
+    if (!list) return;
+    /* Ordering changed, so previously saved row and scroll offsets no longer
+     * identify the same entries. Keep the current path and restart there. */
+    page_start = 0;
+    position_depth = 0;
+    position_overflow = 0;
+    restore_pending = false;
+    restore_scroll_y = 0;
+    last_selected_row = -1;
+    scan_current_dir();
+    rebuild_list();
+}
+
+bool file_browser_build_playlist_from_m3u(const char * m3u_path, char *** out_playlist, int * out_count) {
+    char ** paths = NULL;
+    int count = 0;
+    *out_playlist = NULL;
+    *out_count = 0;
+    if (!playlist_files_read(m3u_path, &paths, &count)) return false;
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        if (file_browser_is_playable_name(paths[i])) paths[kept++] = paths[i];
+        else free(paths[i]);
+    }
+    if (!kept) { free(paths); return false; }
+    *out_playlist = paths;
+    *out_count = kept;
+    return true;
+}
+
+bool file_browser_at_root(void) {
+    return strlen(current_dir) <= strlen(root_dir);
+}
+
+void file_browser_go_up(void) {
+    char * last_slash = strrchr(current_dir, '/');
+    if (last_slash && strlen(current_dir) > strlen(root_dir)) {
+        *last_slash = '\0';
+        if (strlen(current_dir) < strlen(root_dir)) {
+            snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
+        }
+        bool restore = false;
+        if (position_overflow > 0) {
+            position_overflow--;
+            page_start = 0;
+        } else if (position_depth > 0) {
+            position_depth--;
+            page_start = position_stack[position_depth].page_start;
+            restore_scroll_y = position_stack[position_depth].scroll_y;
+            restore = true;
+        } else {
+            page_start = 0;
+        }
+        scan_current_dir();
+        restore_pending = restore;
+        restore_generation = index_request_generation;
+        rebuild_list();
+    }
+}
+
+static void up_click_cb(lv_event_t * e) {
+    (void) e;
+    file_browser_go_up();
+}
+
+static void page_click_cb(lv_event_t * e) {
+    int delta = (int) (intptr_t) lv_event_get_user_data(e);
+    int next = page_start + delta;
+    if (next < 0) next = 0;
+    if (next >= entry_count) next = entry_count > 0
+        ? ((entry_count - 1) / FILE_BROWSER_PAGE_SIZE) * FILE_BROWSER_PAGE_SIZE : 0;
+    if (next == page_start) return;
+    page_start = next;
+    if (!load_visible_entries()) {
+        atomic_store(&index_worker_error, true);
+        entry_count = -1;
+    }
+    rebuild_list();
+}
+
+static void entry_click_cb(lv_event_t * e) {
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    dir_entry_t clicked;
+    if (!index_entry_at(current_index, (unsigned)index, &clicked)) return;
+
+    if (clicked.is_dir) {
+        char new_dir[PATH_MAX];
+        if (!join_path(new_dir, sizeof(new_dir), current_dir, clicked.name)) return;
+        snprintf(current_dir, sizeof(current_dir), "%s", new_dir);
+        if (position_depth < FILE_BROWSER_POSITION_STACK) {
+            position_stack[position_depth].page_start = page_start;
+            position_stack[position_depth].scroll_y = list ? lv_obj_get_scroll_y(list) : 0;
+            position_depth++;
+        } else {
+            position_overflow++;
+        }
+        restore_pending = false;
+        page_start = 0;
+        scan_current_dir();
+        rebuild_list();
+    } else if (clicked.is_playlist) {
+        char m3u_path[PATH_MAX];
+        if (!join_path(m3u_path, sizeof(m3u_path), current_dir, clicked.name)) return;
+
+        char ** playlist;
+        int count;
+        if (file_browser_build_playlist_from_m3u(m3u_path, &playlist, &count)) {
+            snprintf(last_selected_dir, sizeof(last_selected_dir), "%s", current_dir);
+            last_selected_row = index;
+            select_cb(playlist, count, 0);
+        }
+    } else if (clicked.is_cue) {
+        char cue_path[PATH_MAX];
+        if (!join_path(cue_path, sizeof(cue_path), current_dir, clicked.name)) return;
+        snprintf(last_selected_dir, sizeof(last_selected_dir), "%s", current_dir);
+        last_selected_row = index;
+        cue_select_cb(cue_path);
+    } else {
+        snprintf(last_selected_dir, sizeof(last_selected_dir), "%s", current_dir);
+        last_selected_row = index;
+        build_playlist_and_select(index);
+    }
+}
+
+/* A single touch-list row, shared geometry/style with every other row list
+ * in the app (LIST_ROW_* in screen_builders.h). `icon_asset` is NULL for a
+ * plain file (just an indented label); directories and playlists each get
+ * their own real icon. */
+static lv_obj_t * add_file_row(const char * label_text, const char * icon_asset, lv_event_cb_t cb, void * user_data) {
+    lv_obj_t * row = lv_obj_create(list);
+    /* Files is a Music submenu, so it shares the roomier 100px browsing
+     * density used by Artists/Albums/All Songs; Settings stays at the
+     * shared 84px default. */
+    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT);
+    lv_obj_add_style(row, &pill_row_bg_style, 0);
+    lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * label = lv_label_create(row);
+    lv_label_set_text(label, label_text);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+
+    if (icon_asset) {
+        lv_obj_t * icon = lv_image_create(row);
+        lv_image_set_src(icon, asset_path(icon_asset));
+        lv_obj_align(icon, LV_ALIGN_LEFT_MID, 16, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 72, 0);
+        lv_obj_set_width(label, LIST_ROW_WIDTH_WIDE - BOARD_SCALE_PX(88));
+    } else {
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+        lv_obj_set_width(label, LIST_ROW_WIDTH_WIDE - 2 * LIST_ROW_LABEL_INSET);
+    }
+
+    if (cb) {
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, user_data);
+    }
+    return row;
+}
+
+static void rebuild_list(void) {
+    lv_obj_clean(list);
+    lv_label_set_text(path_label, current_dir);
+    if (entry_count < 0) {
+            add_file_row(atomic_load(&index_worker_oversized)
+                         ? TR("Folder too large to index (tap Back)")
+                         : TR("Unable to read folder (tap Back and retry)"), NULL, NULL, NULL);
+        return;
+    }
+
+    if (strlen(current_dir) > strlen(root_dir)) {
+        add_file_row(TR("Back"), "sub_back/btn_back.png", up_click_cb, NULL);
+    }
+
+    if (page_start > 0) {
+        add_file_row(TR("Previous"), "sub_back/btn_back.png", page_click_cb,
+                     (void *) (intptr_t) -FILE_BROWSER_PAGE_SIZE);
+    }
+
+    if (entry_count == 0) {
+        build_list_message(list,
+                           strlen(current_dir) > strlen(root_dir)
+                               ? TR("No playable files here")
+                               : TR("No playable audio files found"),
+                           TR("Open a folder containing supported audio files."));
+        return;
+    }
+
+    int page_end = page_start + FILE_BROWSER_PAGE_SIZE;
+    if (page_end > entry_count) page_end = entry_count;
+    for (int i = page_start; i < page_end; i++) {
+        const char * icon_asset = NULL;
+        dir_entry_t *entry = &entries[i - page_start];
+        if (entry->is_dir) icon_asset = "touch_list/list_folder.png";
+        else if (entry->is_playlist) icon_asset = "sub_back/btn_playlist.png";
+        /* No dedicated cue-sheet icon asset exists in this theme -- reuses
+         * the playlist one, the closest existing match semantically (both
+         * represent "tap to see a list of tracks", not a single song). */
+        else if (entry->is_cue) icon_asset = "sub_back/btn_playlist.png";
+        add_file_row(entry->name, icon_asset, entry_click_cb, (void *) (intptr_t) i);
+    }
+
+    if (page_end < entry_count) {
+        add_file_row(TR("Next"), "playing_plane/btn_next.png", page_click_cb,
+                     (void *) (intptr_t) FILE_BROWSER_PAGE_SIZE);
+    }
+}
+
+/* Maximum directory recursion depth when walking song directories. */
+#define SCAN_ALL_SONGS_MAX_DEPTH 64
+
+
+/* Bounded-memory variant used by the database scanner. Does not sort:
+ * ordering belongs in the on-disk DB, not in the discovery pass.
+ * False means the scan is void. Unreadable entries and subtrees are stepped
+ * over and counted in *skipped, which marks the walk incomplete. add_files is
+ * inherited from the parent and flipped by database.ignore/database.unignore;
+ * subdirectories are descended either way, so a nested database.unignore can
+ * re-include a subtree. */
+static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_visit_cb_t cb, void * user,
+                                     int * count, int depth, atomic_int * progress,
+                                     int * skipped, bool add_files) {
+    if (depth > SCAN_ALL_SONGS_MAX_DEPTH) { (*skipped)++; return true; }
+
+    DIR * dir = opendir(dir_path);
+    if (!dir) { (*skipped)++; return true; }
+
+    /* One path buffer for the whole frame: this function recurses to
+     * SCAN_ALL_SONGS_MAX_DEPTH on a fixed-size thread stack. */
+    char path_buf[PATH_MAX];
+    int probe_len = snprintf(path_buf, sizeof(path_buf), "%s/database.ignore", dir_path);
+    bool has_ignore = (probe_len > 0 && (size_t) probe_len < sizeof(path_buf) && access(path_buf, F_OK) == 0);
+
+    probe_len = snprintf(path_buf, sizeof(path_buf), "%s/database.unignore", dir_path);
+    bool has_unignore = (probe_len > 0 && (size_t) probe_len < sizeof(path_buf) && access(path_buf, F_OK) == 0);
+
+    if (has_ignore != has_unignore) add_files = has_unignore;
+
+    bool fatal = false;
+    struct dirent * de;
+    for (;;) {
+        errno = 0;
+        de = readdir(dir);
+        if (!de) {
+            /* NULL is end-of-directory or a read error; errno separates them.
+             * An error hides the rest of this directory, so it counts as an
+             * omission rather than a clean end. */
+            if (errno) (*skipped)++;
+            break;
+        }
+        if (de->d_name[0] == '.') continue;
+
+        int length = snprintf(path_buf, sizeof(path_buf), "%s/%s", dir_path, de->d_name);
+        if (length < 0 || (size_t) length >= sizeof(path_buf)) { (*skipped)++; continue; }
+
+        struct stat st;
+        bool stat_ok = lstat(path_buf, &st) == 0;
+        if (progress) atomic_fetch_add_explicit(progress, 1, memory_order_relaxed);
+        if (!stat_ok) { (*skipped)++; continue; }
+        /* Reject symlinks to prevent path traversal outside the music root. */
+        if (S_ISLNK(st.st_mode)) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            if (!walk_all_songs_recursive(path_buf, cb, user, count, depth + 1, progress,
+                                          skipped, add_files)) {
+                fatal = true;
+                break;
+            }
+            continue;
+        }
+        if (!file_browser_is_playable_name(de->d_name)) continue;
+
+        if (add_files) {
+            (*count)++;
+            if (cb && !cb(path_buf, user)) { fatal = true; break; }
+        }
+    }
+
+    closedir(dir);
+    return !fatal;
+}
+
+bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
+                                 int * out_count, atomic_int * progress, int * out_skipped) {
+    int count = 0;
+    int skipped = 0;
+    /* A root that cannot be opened is a void scan, not an empty library. */
+    DIR * root_dir = opendir(root);
+    if (!root_dir) {
+        if (out_count) *out_count = 0;
+        if (out_skipped) *out_skipped = 0;
+        return false;
+    }
+    closedir(root_dir);
+    bool completed = walk_all_songs_recursive(root, cb, user, &count, 0, progress, &skipped, true);
+    if (out_count) *out_count = count;
+    if (out_skipped) *out_skipped = skipped;
+    return completed;
+}
+
+void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select_cb_t on_select,
+                        file_browser_cue_select_cb_t on_cue_select) {
+    lv_obj_add_event_cb(parent, browser_delete_cb, LV_EVENT_DELETE, NULL);
+    select_cb = on_select;
+    cue_select_cb = on_cue_select;
+    snprintf(root_dir, sizeof(root_dir), "%s", root);
+    snprintf(current_dir, sizeof(current_dir), "%s", root);
+    page_start = 0;
+    position_depth = position_overflow = 0;
+    restore_pending = false;
+
+    path_label = lv_label_create(parent);
+    lv_obj_set_style_text_color(path_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_width(path_label, lv_display_get_horizontal_resolution(lv_display_get_default()) -
+                                 BOARD_SCALE_PX(20));
+    lv_label_set_long_mode(path_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(path_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align(path_label, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 4);
+    lv_label_set_text(path_label, current_dir);
+
+    /* Plain flex-column container, not lv_list -- rows are hand-built pill
+     * shapes (add_file_row), not lv_list's own button/text item API. */
+    list = lv_obj_create(parent);
+    lv_obj_set_size(list, lv_pct(100),
+                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
+                        TITLE_ROW_HEIGHT - (lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_SUBTEXT)) +
+                        BOARD_SCALE_PX(10)) - HOME_INDICATOR_CONTENT_INSET);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, -HOME_INDICATOR_CONTENT_INSET);
+    lv_obj_set_style_bg_opa(list, 0, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    /* Vertical-only scrolling so horizontal back-swipe gestures can escalate
+     * to LV_EVENT_GESTURE instead of being consumed as scroll events. */
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_width(list, BOARD_SCALE_PX(3), LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(list, BOARD_SCALE_PX(2), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(list, LV_OPA_50, LV_PART_SCROLLBAR);
+    lv_obj_add_style(list, gui_theme_accent_style(), LV_PART_SCROLLBAR);
+    /* Clear default theme padding so rows center properly without edge clipping. */
+    lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(list, GUI_ROW_GAP, 0);
+    lv_obj_set_style_pad_top(list, GUI_ROW_GAP, 0);
+    lv_obj_set_style_pad_bottom(list, BOARD_SCALE_PX(8), 0);
+    /* Rows follow the live display width. Explicit cross-axis centering also
+     * keeps this correct if a future parent is narrower than the display. */
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+
+    if (!index_poll_timer) index_poll_timer = lv_timer_create(index_poll_cb, 100, NULL);
+    scan_current_dir();
+    rebuild_list();
+}
+
+bool file_browser_release_card(void) {
+    pthread_mutex_lock(&index_worker_mu);
+    card_released = true;
+    index_request_generation++;
+    atomic_store(&index_worker_cancel, true);
+    if (index_worker_result) { file_browser_index_close(index_worker_result); index_worker_result = NULL; }
+    bool running = atomic_load(&index_worker_running);
+    pthread_mutex_unlock(&index_worker_mu);
+    free_entries();
+    restore_pending = false;
+    if (list) rebuild_list();
+    return !running;
+}
+
+/* Resets the browser to root and refreshes the directory listing on SD card
+ * hotplug events (mount/unmount) to avoid displaying stale or removed files. */
+void file_browser_reset_to_root(void) {
+    pthread_mutex_lock(&index_worker_mu);
+    card_released = false;
+    pthread_mutex_unlock(&index_worker_mu);
+    if (!list) return; /* gui_library_get_files_screen() not built yet -- nothing to refresh */
+    snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
+    page_start = 0;
+    position_depth = position_overflow = 0;
+    restore_pending = false;
+    scan_current_dir();
+    rebuild_list();
+}
+
+const char * file_browser_get_last_selected_dir(void) {
+    return last_selected_dir;
+}
+
+int file_browser_get_last_selected_row(void) {
+    return last_selected_row;
+}
+
+
+bool file_browser_build_playlist_for_path(const char * path, char *** out_playlist, int * out_count, int * out_selected_index) {
+    const char * slash = strrchr(path, '/');
+    if (!slash) return false;
+
+    char dir_path[PATH_MAX];
+    size_t dir_len = (size_t) (slash - path);
+    if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+    memcpy(dir_path, path, dir_len);
+    dir_path[dir_len] = '\0';
+
+    dir_entry_t * scanned = NULL;
+    int scanned_count = scan_directory(dir_path, &scanned, sort_mode_snapshot(), true);
+    if (scanned_count < 0) return false;
+
+    char ** playlist = malloc(sizeof(char *) * (size_t) (scanned_count > 0 ? scanned_count : 1));
+    if (!playlist) {
+        free(scanned);
+        return false;
+    }
+    int count = 0;
+    int selected = -1;
+
+    for (int i = 0; i < scanned_count; i++) {
+        if (scanned[i].is_dir || scanned[i].is_playlist || scanned[i].is_cue) continue;
+
+        char full_path[PATH_MAX];
+        if (!join_path(full_path, sizeof(full_path), dir_path, scanned[i].name)) continue;
+        if (strcmp(full_path, path) == 0) selected = count;
+
+        playlist[count] = strdup(full_path);
+        if (!playlist[count]) {
+            for (int j = 0; j < count; j++) free(playlist[j]);
+            free(playlist);
+            free(scanned);
+            return false;
+        }
+        count++;
+    }
+
+    free(scanned);
+
+    if (selected < 0) {
+        for (int i = 0; i < count; i++) free(playlist[i]);
+        free(playlist);
+        return false;
+    }
+
+    *out_playlist = playlist;
+    *out_count = count;
+    *out_selected_index = selected;
+    return true;
+}
+
+bool file_browser_open_lazy_directory(const char *track_path, file_browser_index_t **out_index,
+                                      unsigned *out_playable, unsigned *out_selected) {
+    if (out_index) *out_index = NULL;
+    if (out_playable) *out_playable = 0;
+    if (out_selected) *out_selected = 0;
+    if (!track_path || !out_index || !out_playable || !out_selected) return false;
+    const char *slash = strrchr(track_path, '/');
+    if (!slash || slash == track_path) return false;
+    char dir_path[PATH_MAX];
+    size_t dir_len = (size_t) (slash - track_path);
+    if (dir_len >= sizeof(dir_path)) return false;
+    memcpy(dir_path, track_path, dir_len);
+    dir_path[dir_len] = '\0';
+    file_browser_index_t *index = NULL;
+    unsigned count = 0;
+    if (!file_browser_index_open(dir_path, &index, &count)) return false;
+    unsigned playable = file_browser_index_playable_count(index);
+    for (unsigned i = 0; i < playable; i++) {
+        char path[PATH_MAX];
+        if (!file_browser_index_playable_path_at(index, i, path, sizeof(path))) {
+            file_browser_index_close(index);
+            return false;
+        }
+        if (strcmp(path, track_path) == 0) {
+            *out_index = index;
+            *out_playable = playable;
+            *out_selected = i;
+            return true;
+        }
+    }
+    file_browser_index_close(index);
+    return false;
+}

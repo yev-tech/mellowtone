@@ -1,0 +1,126 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "",
+        "CMAKE_C_FLAGS": "",
+        "CMAKE_CXX_FLAGS": "",
+        "CMAKE_EXE_LINKER_FLAGS": ""
+      }
+    },
+    {
+      "name": "device",
+      "hidden": true,
+      "inherits": "base",
+      "toolchainFile": "${sourceDir}/cmake/mipsel-musl.cmake"
+    },
+    {
+      "name": "r1",
+      "inherits": "device",
+      "displayName": "Player for r1",
+      "cacheVariables": {
+        "MT_BOARD": "r1"
+      }
+    },
+    {
+      "name": "r3pro",
+      "inherits": "device",
+      "displayName": "Player for r3pro",
+      "cacheVariables": {
+        "MT_BOARD": "r3pro"
+      }
+    },
+    {
+      "name": "r3proii",
+      "inherits": "device",
+      "displayName": "Player for r3proii",
+      "cacheVariables": {
+        "MT_BOARD": "r3proii"
+      }
+    },
+    {
+      "name": "r3ii_2025",
+      "inherits": "device",
+      "displayName": "Player for r3ii_2025",
+      "cacheVariables": {
+        "MT_BOARD": "r3ii_2025"
+      }
+    },
+    {
+      "name": "host",
+      "inherits": "base",
+      "displayName": "SDL host simulator (R1 screen)",
+      "cacheVariables": {
+        "MT_BOARD": "r1",
+        "MT_HOST": "ON",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "host-minimal",
+      "inherits": "host",
+      "displayName": "SDL host simulator with every optional feature off",
+      "cacheVariables": {
+        "MT_FEATURE_AIRPLAY": "OFF",
+        "MT_FEATURE_DLNA_RENDERER": "OFF",
+        "MT_FEATURE_WIFI_IMPORT": "OFF",
+        "MT_FEATURE_REMOTE": "OFF",
+        "MT_CODEC_OPUS": "OFF",
+        "MT_CODEC_WMA": "OFF",
+        "MT_I18N": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "r1",
+      "configurePreset": "r1"
+    },
+    {
+      "name": "r3pro",
+      "configurePreset": "r3pro"
+    },
+    {
+      "name": "r3proii",
+      "configurePreset": "r3proii"
+    },
+    {
+      "name": "r3ii_2025",
+      "configurePreset": "r3ii_2025"
+    },
+    {
+      "name": "host",
+      "configurePreset": "host"
+    },
+    {
+      "name": "host-minimal",
+      "configurePreset": "host-minimal"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "host",
+      "configurePreset": "host",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "host-minimal",
+      "inherits": "host",
+      "configurePreset": "host-minimal"
+    }
+  ]
+}

@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mt <mt@localhost>
+Date: Mon, 5 Oct 2026 22:05:53 +0000
+Subject: [PATCH] audio/device: avoid the sink auto-connect race when the
+ remote side connects A2DP itself.
+
+---
+ audio/device.c | 109 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 109 insertions(+)
+
+diff --git a/audio/device.c b/audio/device.c
+index b7b993e..1c6ad47 100644
+--- a/audio/device.c
++++ b/audio/device.c
+@@ -36,6 +36,11 @@
+ #include <bluetooth/bluetooth.h>
+ #include <bluetooth/sdp.h>
+ #include <bluetooth/sdp_lib.h>
++#include <bluetooth/hci.h>
++#include <bluetooth/hci_lib.h>
++#include <sys/ioctl.h>
++#include <fcntl.h>
++#include <string.h>
+ 
+ #include <glib.h>
+ #include <dbus/dbus.h>
+@@ -292,6 +297,15 @@ static gboolean avdtp_connect_timeout(gpointer user_data)
+ 
+ 	dev->priv->avdtp_timer = 0;
+ 
++	/*
++	 * R3Pro car-Bluetooth fix (Patch A, ported to source): do not auto-
++	 * initiate A2DP stream setup when the signalling channel comes up.
++	 * Remotes that initiate A2DP themselves (car head units) would collide
++	 * with us ("connect:connect XCASE") and neither stream gets set up.
++	 * Let the remote initiate; play/Connect-initiated setup is unaffected.
++	 */
++	return FALSE;
++
+ 	if (dev->sink) {
+ 		struct avdtp *session = avdtp_get(&dev->src, &dev->dst);
+ 
+@@ -380,6 +394,99 @@ static void device_avdtp_cb(struct audio_device *dev, struct avdtp *session,
+ 	}
+ }
+ 
++/*
++ * HiBy: Broadcom combo chips (bcmdhd) can be asked to give the A2DP ACL link
++ * high priority over Wi-Fi coexistence (vendor HCI 0xFD1A). HiBy's stock
++ * daemon does this when a sink connects, only if the bcmdhd driver reports a
++ * "sink" capable firmware. Needed to sustain high-bitrate codecs (LDAC).
++ */
++static gboolean vendor_bcm_has_sink_flag(void)
++{
++	char buf[64];
++	gboolean ret = FALSE;
++	int fd, len;
++
++	fd = open("/sys/module/bcmdhd/parameters/version_string", O_RDONLY);
++	if (fd < 0)
++		return FALSE;
++
++	memset(buf, 0, sizeof(buf));
++	len = read(fd, buf, sizeof(buf) - 2);
++	if (len > 0 && strstr(buf, "sink"))
++		ret = TRUE;
++	close(fd);
++
++	DBG("%s need to adjust sink priority", ret ? "" : "don't");
++	return ret;
++}
++
++/* HiBy-style: raw HCI socket + HCIGETCONNLIST + write(). No logging or
++ * library helpers in between; runs from an idle callback, outside the
++ * AVDTP/D-Bus callback chain (calling it inline could deadlock). */
++static gboolean vendor_bcm_set_high_priority(gpointer user_data)
++{
++	bdaddr_t *dst = user_data;
++	struct sockaddr_hci addr;
++	struct hci_conn_list_req *cl;
++	struct hci_conn_info *ci;
++	uint8_t cmd[8] = { 0x01, 0x1a, 0xfd, 0x04, 0x00, 0x00, 0x01, 0x00 };
++	int sk, i, handle = -1, opt = 1, ret = -1;
++
++	sk = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
++	if (sk < 0)
++		goto out;
++
++	setsockopt(sk, SOL_HCI, HCI_DATA_DIR, &opt, sizeof(opt));
++
++	memset(&addr, 0, sizeof(addr));
++	addr.hci_family = AF_BLUETOOTH;
++	addr.hci_dev = 0;
++	if (bind(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0)
++		goto close;
++
++	/* This kernel's hci_conn_info is larger than BlueZ's header (it overflows
++	 * HCIGETCONNINFO users, e.g. HiBy's own hcitool), so over-allocate. */
++	cl = g_malloc0(sizeof(*cl) + 10 * sizeof(*ci) + 512);
++	cl->dev_id = 0;
++	cl->conn_num = 10;
++	ci = cl->conn_info;
++
++	if (ioctl(sk, HCIGETCONNLIST, (void *) cl) == 0) {
++		for (i = 0; i < cl->conn_num; i++, ci++)
++			if (ci->type == ACL_LINK && !bacmp(&ci->bdaddr, dst)) {
++				handle = ci->handle;
++				break;
++			}
++	}
++	g_free(cl);
++
++	if (handle < 0)
++		goto close;
++
++	cmd[4] = handle & 0xff;
++	cmd[5] = handle >> 8;
++	if (write(sk, cmd, sizeof(cmd)) == sizeof(cmd))
++		ret = 0;
++
++close:
++	close(sk);
++out:
++	DBG("BCM A2DP high priority %s (handle %d)", ret == 0 ? "set" :
++							"failed", handle);
++	g_free(dst);
++	return FALSE;
++}
++
++/* On by default (as HiBy stock); /data/bt_prio_disable is an opt-out. */
++static void vendor_bcm_schedule_priority(struct audio_device *dev)
++{
++	if (access("/data/bt_prio_disable", F_OK) == 0)
++		return;
++
++	g_idle_add(vendor_bcm_set_high_priority, g_memdup(&dev->dst,
++							sizeof(bdaddr_t)));
++}
++
+ static void device_sink_cb(struct audio_device *dev,
+ 				sink_state_t old_state,
+ 				sink_state_t new_state,
+@@ -424,6 +531,8 @@ static void device_sink_cb(struct audio_device *dev,
+ 	case SINK_STATE_CONNECTED:
+ 		if (old_state == SINK_STATE_PLAYING)
+ 			break;
++		if (vendor_bcm_has_sink_flag())
++			vendor_bcm_schedule_priority(dev);
+ 		if (dev->auto_connect) {
+ 			if (!dev->headset)
+ 				device_set_state(dev, AUDIO_STATE_CONNECTED);

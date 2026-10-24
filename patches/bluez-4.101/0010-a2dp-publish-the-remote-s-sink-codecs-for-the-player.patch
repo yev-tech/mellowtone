@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yev-tech <347553623+yev-tech@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 00:11:56 -0400
+Subject: [PATCH] a2dp: publish the remote's sink codecs for the player
+
+The player picks the codec per device (LDAC, aptX, AAC, SBC, whichever
+is best of what the device has) and must set audio.conf's DefaultCodec
+before HiBy's ALSA plugin opens the stream, but nothing told it which
+codecs a device has. Write them to /tmp/bt_a2dp_remote when SEP
+discovery completes, in the /tmp/bt_a2dp_stream style (tmp + rename).
+
+When the remote configured the stream itself and we never ran DISCOVER
+(the acceptor path, where SEPs are synthesized from the stream), only
+its configured codec is known: complete=0 says so.
+---
+ audio/avdtp.c | 121 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 121 insertions(+)
+
+diff --git a/audio/avdtp.c b/audio/avdtp.c
+index 5d10ab5..f1a3b84 100644
+--- a/audio/avdtp.c
++++ b/audio/avdtp.c
+@@ -27,6 +27,7 @@
+ #endif
+ 
+ #include <stdlib.h>
++#include <string.h>
+ #include <sys/ioctl.h>
+ #include <fcntl.h>
+ #include <stdio.h>
+@@ -55,6 +56,7 @@
+ #include "manager.h"
+ #include "control.h"
+ #include "avdtp.h"
++#include "a2dp-codecs.h"
+ #include "hiby-codecs.h"
+ #include "btio.h"
+ #include "sink.h"
+@@ -437,6 +439,10 @@ struct avdtp {
+ 	/* Attempt stream setup instead of disconnecting */
+ 	gboolean stream_setup;
+ 
++	/* HiBy: seps were synthesized from streams the remote configured,
++	 * not discovered, so they list only the codecs in use */
++	gboolean seps_synthesized;
++
+ 	DBusPendingCall *pending_auth;
+ };
+ 
+@@ -1043,6 +1049,114 @@ static void handle_unanswered_req(struct avdtp *session,
+ 	pending_req_free(req);
+ }
+ 
++/* HiBy: publish the remote's A2DP sink codecs to /tmp/bt_a2dp_remote
++ * ("addr=XX:XX:XX:XX:XX:XX codecs=LDAC,AAC,SBC complete=1") so the player
++ * can choose a codec the device has before HiBy's ALSA plugin opens the
++ * stream with audio.conf's DefaultCodec. complete=0: only what the remote
++ * configured on its own is known (it connected and set up the stream
++ * itself, and asking it for DISCOVER again is what car head units reject). */
++#define A2DP_REMOTE_INFO_PATH "/tmp/bt_a2dp_remote"
++
++static const char *hiby_codec_name(struct avdtp_service_capability *cap)
++{
++	struct avdtp_media_codec_capability *mc;
++	const a2dp_vendor_codec_t *vc;
++
++	if (!cap || cap->category != AVDTP_MEDIA_CODEC ||
++					cap->length < sizeof(*mc))
++		return NULL;
++	mc = (void *) cap->data;
++	if (mc->media_type != AVDTP_MEDIA_TYPE_AUDIO)
++		return NULL;
++	switch (mc->media_codec_type) {
++	case A2DP_CODEC_SBC:
++		return "SBC";
++	case A2DP_CODEC_MPEG12:
++		return "MPEG12";
++	case A2DP_CODEC_MPEG24:
++		return "AAC";
++	case A2DP_CODEC_VENDOR:
++		if (cap->length < sizeof(*mc) + sizeof(*vc))
++			return NULL;
++		vc = (const void *) mc->data;
++		if (btohl(vc->vendor_id) == LDAC_VENDOR_ID &&
++				btohs(vc->codec_id) == LDAC_CODEC_ID)
++			return "LDAC";
++		if (btohl(vc->vendor_id) == APTX_VENDOR_ID &&
++				btohs(vc->codec_id) == APTX_CODEC_ID)
++			return "APTX";
++		if (btohl(vc->vendor_id) == UAT_VENDOR_ID)
++			return btohs(vc->codec_id) == UAT_TWS_CODEC_ID ?
++							"UAT_TWS" : "UAT";
++		return NULL;
++	}
++	return NULL;
++}
++
++/* Appends name to the comma-separated list unless it is already there. */
++static void hiby_list_add(char *list, size_t size, const char *name)
++{
++	size_t n = strlen(name), used = strlen(list);
++	const char *p = list;
++
++	while (*p) {
++		size_t len = strcspn(p, ",");
++
++		if (len == n && strncmp(p, name, n) == 0)
++			return;
++		p += len;
++		if (*p)
++			p++;
++	}
++	if (used + n + 2 > size)
++		return;
++	snprintf(list + used, size - used, "%s%s", used ? "," : "", name);
++}
++
++static void hiby_publish_remote_codecs(struct avdtp *session)
++{
++	char list[96] = "", addr[18], tmp[] = A2DP_REMOTE_INFO_PATH ".tmp";
++	gboolean complete = !session->seps_synthesized;
++	GSList *l;
++	FILE *f;
++
++	for (l = session->seps; l != NULL; l = g_slist_next(l)) {
++		struct avdtp_remote_sep *rsep = l->data;
++		const char *name = hiby_codec_name(rsep->codec);
++
++		if (rsep->type == AVDTP_SEP_TYPE_SINK && name)
++			hiby_list_add(list, sizeof(list), name);
++	}
++
++	if (!session->seps) {
++		/* Remote-configured streams not yet turned into seps */
++		complete = FALSE;
++		for (l = session->streams; l != NULL; l = g_slist_next(l)) {
++			struct avdtp_stream *stream = l->data;
++			const char *name = hiby_codec_name(stream->codec);
++
++			if (stream->lsep->info.type == AVDTP_SEP_TYPE_SOURCE &&
++									name)
++				hiby_list_add(list, sizeof(list), name);
++		}
++	}
++
++	if (!list[0])
++		return;
++
++	ba2str(&session->dst, addr);
++	f = fopen(tmp, "w");
++	if (!f)
++		return;
++	fprintf(f, "addr=%s codecs=%s complete=%d\n", addr, list,
++							complete ? 1 : 0);
++	fclose(f);
++	if (rename(tmp, A2DP_REMOTE_INFO_PATH) < 0)
++		unlink(tmp);
++	DBG("remote codecs: %s %s%s", addr, list,
++					complete ? "" : " (configured only)");
++}
++
+ static void avdtp_sep_set_state(struct avdtp *session,
+ 				struct avdtp_local_sep *sep,
+ 				avdtp_state_t state)
+@@ -1075,6 +1189,8 @@ static void avdtp_sep_set_state(struct avdtp *session,
+ 	case AVDTP_STATE_CONFIGURED:
+ 		if (sep->info.type == AVDTP_SEP_TYPE_SINK)
+ 			avdtp_delay_report(session, stream, stream->delay);
++		if (!session->seps)
++			hiby_publish_remote_codecs(session);
+ 		break;
+ 	case AVDTP_STATE_OPEN:
+ 		stream->starting = FALSE;
+@@ -1140,6 +1256,9 @@ static void finalize_discovery(struct avdtp *session, int err)
+ 
+ 	avdtp_error_init(&avdtp_err, AVDTP_ERRNO, err);
+ 
++	if (!err)
++		hiby_publish_remote_codecs(session);
++
+ 	if (!session->discov_cb)
+ 		return;
+ 
+@@ -2926,6 +3045,7 @@ static gboolean avdtp_discover_resp(struct avdtp *session,
+ 			sep = g_new0(struct avdtp_remote_sep, 1);
+ 			session->seps = g_slist_append(session->seps, sep);
+ 		}
++		session->seps_synthesized = FALSE;
+ 
+ 		sep->stream = stream;
+ 		sep->seid = resp->seps[i].seid;
+@@ -3597,6 +3717,7 @@ static void avdtp_seps_from_streams(struct avdtp *session)
+ 		rsep->stream = stream;
+ 
+ 		session->seps = g_slist_append(session->seps, rsep);
++		session->seps_synthesized = TRUE;
+ 
+ 		DBG("synthesized remote SEP seid %d type %d from existing "
+ 				"stream (acceptor path)", rsep->seid, rsep->type);

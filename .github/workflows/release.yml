@@ -1,0 +1,87 @@
+# Pushing a tag v<version> (for example v0.1.0) builds the update packages
+# for the released boards (RELEASE_BOARDS in tools/release/build_release.sh;
+# the R3 Pro for now) and creates a draft GitHub Release with them. Review the
+# draft, then publish it. Firmware images are never built here: they contain
+# HiBy's software (docs/FIRMWARE.md).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for a test build (no release is created; the files are a workflow artifact)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  MT_ENGINE: docker
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then v=${GITHUB_REF_NAME#v}; else v=$INPUT_VERSION; fi
+          [[ $v =~ ^[A-Za-z0-9._+-]+$ ]] || { echo "bad version '$v'"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Download cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mellowtone
+          key: mt-deps-${{ hashFiles('cmake/dependencies.cmake') }}
+          restore-keys: mt-deps-
+
+      - name: Build container
+        run: ./mt setup build
+
+      - name: Tests
+        run: ./mt test
+
+      - name: Build the release files
+        run: tools/release/build_release.sh "${{ steps.version.outputs.version }}" out/release
+
+      - name: Keep the files as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mellowtone-${{ steps.version.outputs.version }}
+          path: out/release/
+
+      - name: Create the draft release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          Player update packages for Mellowtone $VERSION.
+
+          **Install:** copy the package for your player to the memory card's
+          \`.mellowtone/update/\` folder, then pick "Install player update" in the
+          recovery menu (or About > "Player update available"). The installed
+          version is saved to the card first, so you can roll back.
+
+          | Player | Package |
+          |---|---|
+          | HiBy R3 Pro | \`mellowtone-r3pro-$VERSION.tar\` |
+
+          The R1, R3 Pro II and R3 II (2025) builds are not tested on hardware
+          yet, so this release has no packages for them.
+
+          A first install needs the steps in the repository's documentation.
+          \`SHA256SUMS\` lists the checksums; the debug-symbols archive is for
+          reading crash reports.
+          EOF
+          gh release create "$GITHUB_REF_NAME" out/release/* --draft \
+            --title "Mellowtone $VERSION" --notes-file notes.md
